@@ -1,0 +1,15 @@
+<%+header%>
+<h2 name="content"><%:设备总览%></h2>
+<iframe id="opshare-frame" src="/opshare/index.html" scrolling="auto" style="border:0;width:100%;height:80vh;min-height:480px;display:block"></iframe>
+<script type="text/javascript">
+(function () {
+	var f = document.getElementById('opshare-frame');
+	window.addEventListener('message', function (ev) {
+		if (ev.origin !== location.origin || !ev.data ||
+			typeof ev.data.opshareHeight === 'undefined') return;
+		var h = parseInt(ev.data.opshareHeight, 10);
+		if (isFinite(h) && h > 200 && h < 20000) f.style.height = (h + 24) + 'px';
+	}, false);
+})();
+</script>
+<%+footer%>

@@ -1,0 +1,15 @@
+{
+	"luci-app-opshare": {
+		"description": "Read the opshare merged network view over ubus (mobile app bridge)",
+		"read": {
+			"ubus": {
+				"opshare": [ "all", "live", "info" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"opshare": [ "*" ]
+			}
+		}
+	}
+}

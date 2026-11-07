@@ -1,0 +1,17 @@
+#!/bin/sh
+# Clean up runtime state only. /etc/config/opshare is a conffile: opkg keeps it
+# on remove, so a reinstall keeps the tokens, peers and intervals you tuned.
+[ -n "$IPKG_INSTROOT" ] && exit 0
+PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+export PATH
+
+case "$1" in
+remove)
+	rm -rf /tmp/opshare /etc/opshare
+	rm -f /www/opshare/all.json
+	# unregister the ubus object we added in postinst
+	/etc/init.d/rpcd reload >/dev/null 2>&1 || /etc/init.d/rpcd restart >/dev/null 2>&1
+	rm -f /tmp/luci-indexcache* 2>/dev/null
+	;;
+esac
+exit 0

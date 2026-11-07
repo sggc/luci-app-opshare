@@ -1,0 +1,48 @@
+#!/bin/sh
+# Runs after unpacking / on upgrade. opkg gives us a very small environment, so
+# set PATH ourselves and never assume an interactive shell.
+# During image builds (IPKG_INSTROOT set) nothing must be started.
+[ -n "$IPKG_INSTROOT" ] && exit 0
+PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+export PATH
+
+mkdir -p /etc/opshare /tmp/opshare
+
+# Shared secret for the HTTP peer transport. One per device, generated once.
+TOKEN=$(uci -q get opshare.main.token 2>/dev/null)
+if [ -z "$TOKEN" ]; then
+	TOKEN=$(head -c 24 /dev/urandom | md5sum | cut -c1-16)
+	uci set opshare.main.token="$TOKEN" 2>/dev/null
+	uci commit opshare 2>/dev/null
+fi
+
+# rpcd only scans /usr/libexec/rpcd at startup, and both reload and restart are
+# applied asynchronously by procd - the object shows up a second or two later,
+# not when the command returns. Kick it off, then poll in the background: opkg
+# must not sit and wait, and nobody opens the app in those two seconds.
+/etc/init.d/rpcd reload >/dev/null 2>&1
+(
+	i=0
+	while [ "$i" -lt 10 ]; do
+		ubus list opshare >/dev/null 2>&1 && {
+			logger -t opshare "postinst: ubus ready after ${i}s"
+			exit 0
+		}
+		[ "$i" -eq 1 ] && /etc/init.d/rpcd restart >/dev/null 2>&1
+		sleep 1
+		i=$((i + 1))
+	done
+	logger -t opshare "postinst: ubus object did not register, checked /usr/libexec/rpcd/opshare"
+) >/dev/null 2>&1 &
+
+/etc/init.d/opshare enable >/dev/null 2>&1
+/etc/init.d/opshare restart >/dev/null 2>&1
+
+# LuCI caches the menu tree; drop it so 设备总览 shows up straight away.
+rm -f /tmp/luci-indexcache* /tmp/luci-modulecache* 2>/dev/null
+
+# First pairing (probe the gateway + newest leases, ~4 s). Do it in the
+# background: `opkg install` must not block on a LAN full of silent phones.
+( /usr/bin/opshare-peer -q >/dev/null 2>&1 & ) >/dev/null 2>&1
+
+exit 0

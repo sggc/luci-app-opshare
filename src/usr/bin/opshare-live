@@ -1,0 +1,80 @@
+#!/bin/sh
+# opshare-live v1 - assemble the tiny "fine granularity" payload.
+#
+# /tmp/opshare/all.json holds everything (clients, radios, leases, ports) and is
+# several kilobytes. The page needs that at a slow cadence only. What changes
+# every second is the interface counters, so they travel on their own channel:
+# this file, ~1 KB, nothing but pipe-joined counter rows per node.
+#
+#   {"schema":1,"ts":N,"cad":{"t":2,"f":12,"w":1,"l":2000},
+#    "nodes":[{"s":"main","age":0,"t":["lan1|wan|..",".."]},
+#             {"s":"immortalwrt","age":3,"t":[".."]}]}
+#
+# `s` is the node's UCI section (main = this device), the same key the full
+# payload carries in _meta.section, so the page can patch rows in place.
+# Each row is the raw traffic.snap line, so the browser can split('|').
+#
+# Inputs:  traffic.snap (local) + live/<section>.snap + live/<section>.ts
+# Env:     OP_NOW, OP_CAD_T, OP_CAD_F, OP_WATCH, OP_LIVE
+# Cost:    a handful of builtins, no fork except none at all when OP_NOW is set.
+
+RUNDIR=/tmp/opshare
+TSNAP="$RUNDIR/traffic.snap"
+LIVE="$RUNDIR/live"
+
+NOW=${OP_NOW:-}
+case "$NOW" in ''|*[!0-9]*) NOW=$(date +%s 2>/dev/null) ;; esac
+case "$NOW" in ''|*[!0-9]*) NOW=0 ;; esac
+
+CT=${OP_CAD_T:-10}; case "$CT" in ''|*[!0-9]*) CT=10 ;; esac
+CF=${OP_CAD_F:-30}; case "$CF" in ''|*[!0-9]*) CF=30 ;; esac
+CW=${OP_WATCH:-0}; case "$CW" in 1) ;; *) CW=0 ;; esac
+CL=${OP_LIVE:-0}; case "$CL" in ''|*[!0-9]*) CL=0 ;; esac
+
+# emit the rows of one snap file as a JSON string array; sets _OUT and _AGE
+fill_node() { # snapfile tsfile
+	local f=$1 ts=$2 line first=1 out= age=0 s
+	if [ -r "$ts" ]; then
+		IFS=' ' read -r s _rest < "$ts" 2>/dev/null
+		case "$s" in ''|*[!0-9]*) s=0 ;; esac
+		[ "$s" -gt 0 ] && [ "$NOW" -ge "$s" ] && age=$((NOW - s))
+	fi
+	out=''
+	[ -r "$f" ] && while IFS= read -r line; do
+		case "$line" in
+			''|*'"'*|*'\'*) continue ;;
+		esac
+		[ "$first" = "1" ] || out="$out,"
+		out="$out\"$line\""
+		first=0
+	done < "$f"
+	_OUT="$out"
+	_AGE="$age"
+}
+
+node_json=''
+first=1
+fill_node "$TSNAP" ''
+node_json="{\"s\":\"main\",\"age\":0,\"t\":[$_OUT]}"
+first=0
+
+for f in "$LIVE"/*.snap; do
+	[ -r "$f" ] || continue
+	sec=${f##*/}
+	sec=${sec%.snap}
+	[ -n "$sec" ] || continue
+	fill_node "$f" "$LIVE/$sec.ts"
+	[ "$first" = "1" ] || node_json="$node_json,"
+	node_json="$node_json{\"s\":\"$sec\",\"age\":$_AGE,\"t\":[$_OUT]}"
+	first=0
+done
+
+BODY=$(printf '{"schema":1,"ts":%s,"cad":{"t":%s,"f":%s,"w":%s,"l":%s},"nodes":[%s]}' \
+	"$NOW" "$CT" "$CF" "$CW" "$CL" "$node_json")
+printf '%s\n' "$BODY"
+
+# The payload is also left on disk so the CGI/ucode endpoint can serve it with
+# a single read instead of rebuilding it per request.
+printf '%s\n' "$BODY" > "$RUNDIR/live.json.tmp" 2>/dev/null &&
+	mv "$RUNDIR/live.json.tmp" "$RUNDIR/live.json" 2>/dev/null
+exit 0

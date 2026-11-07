@@ -1,0 +1,15 @@
+{
+  "_note": "v8 baseline, measured on the real boxes before the v9 upgrade. AC=4-core Cortex-A53/412MB, AP=MT7621 4-core MIPS 1004Kc/248MB. Config at the time: interval=30, traffic_interval=10 (so the counter was sampled every 10s, not the v8 default 2s).",
+  "bench": {
+    "ac_idle":  {"box_busy_pct": 5.31, "own_cpu_one_core_pct": 0.21, "sync_rss_kb": 1412, "tmpfs_kb": 144},
+    "ac_watch": {"box_busy_pct": 7.63, "own_cpu_one_core_pct": 0.76, "sync_rss_kb": 1416, "tmpfs_kb": 144, "polls": 41},
+    "ap_idle":  {"box_busy_pct": 5.42, "own_cpu_one_core_pct": 0.23, "sync_rss_kb": 1152, "tmpfs_kb": 68},
+    "ap_watch": {"box_busy_pct": 7.61, "own_cpu_one_core_pct": 0.39, "sync_rss_kb": 1152, "tmpfs_kb": 68}
+  },
+  "micro": {
+    "ac": {"wake_per_s": 7.017, "sync_cpu_one_core_pct": 0.48, "traffic_ms": 31.0,
+           "collect_wall_ms": 560.0, "collect_cpu_ms": 570.0, "live_ms": 26.4, "live_bytes": 1025},
+    "ap": {"wake_per_s": 3.967, "sync_cpu_one_core_pct": 0.37, "traffic_ms": 46.0,
+           "collect_wall_ms": 1050.0, "collect_cpu_ms": 1140.0, "live_ms": 46.0, "live_bytes": 539}
+  }
+}

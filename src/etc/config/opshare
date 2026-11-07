@@ -1,0 +1,124 @@
+# opshare - multi-device information sharing
+# ---------------------------------------------------------------------------
+# ROLE is a FREE label; the network topology never decides who is "master".
+#   (empty / 'auto')  -> neutral "节点"; auto-detection only produces a
+#                        neutral SUGGESTION shown in the UI as a hint
+#   master|slave|bridge|aggregator|member|任意自定义文本 -> used verbatim
+#   An upstream router may be a plain member while a downstream box does the
+#   aggregation, so set roles however you like - in the page dropdown or here.
+#   The REAL data flow is defined by `mode` + `peer` sections, never by role.
+#     mode: hub  = collect peers, merge, push the merged view back
+#           pull = fetch an already merged view from a hub
+#           off  = passive, serve the page / accept a pushed snapshot
+#
+# Works for: single DHCP + dumb APs (bridge), dual DHCP / cascaded NAT,
+# and any mixture. Any number of `peer` sections is allowed.
+# ---------------------------------------------------------------------------
+
+config opshare 'main'
+	# enabled by default: installing the package is meant to be the whole setup
+	option enabled '1'
+	# mode: auto = let opshare-peer decide (recommended, zero config)
+	#       hub  = always aggregate every peer and push the merged view
+	#       pull = fetch an already merged view from hub_host
+	#       off  = passive, render whatever the paired hub published
+	option mode 'auto'
+	# when mode=auto, prefer this role if this box has the stronger CPU
+	option desired_mode 'hub'
+	# zero-config pairing: probe the default gateway and the newest DHCP
+	# leases every 2 minutes, pair over plain HTTP, no SSH key required.
+	# Turn it off to manage peer sections by hand only.
+	option auto_pair '1'
+	# auto | low | normal. `auto` reads /proc/cpuinfo and drops into the
+	# low-power profile on MT7621/MT7620/QCA953x class routers (880 MHz MIPS,
+	# where every fork is felt): idle ticks stretch to 12 s, nothing is sampled
+	# while no page is open, and the browser polls at 3 s instead of 2 s.
+	option power_profile 'auto'
+	# port the pairing handshake and the HTTP transport use
+	option http_port '80'
+	option pair_timeout '3'
+	option role 'auto'
+	# empty name = use the device hostname; set it to rename a node everywhere
+	option name ''
+	# empty colour = auto-assign from the palette, one colour per node
+	option color ''
+	# One full cycle length (seconds). Must be > ~12 s (sharded step takes ~6 s).
+	option interval '30'
+	# Sleep between collection phases (1-5 s). This is what flattens the CPU
+	# spike: one long 0.7-1.1 s burst becomes several ~0.1 s blips.
+	option yield_sec '1'
+	# ---- fine-granularity counters -------------------------------------------
+	# Interface counters are read by /usr/bin/opshare-traffic: ONE awk over
+	# /proc/net/dev, no uci, no date, ~10 ms. That is cheap enough to sample
+	# every second, so the numbers on screen no longer have to wait for a full
+	# collection.
+	#   traffic_interval       quiet profile (nobody has the page open)
+	#   fast_traffic_interval  while somebody is looking (2 s = near-real-time)
+	option traffic_interval '10'
+	option fast_traffic_interval '2'
+	# Full collection while somebody is looking. 8 s is the floor (a sharded
+	# step already takes 5-6 s); 12 s leaves the box idle half the time.
+	option fast_interval '12'
+	# How long a browser request counts as "somebody is looking".
+	option watch_ttl '45'
+	# How often the page asks for the tiny counter payload.
+	option live_ms '2000'
+	# collect cache lifetime (seconds); protects against repeated viewers
+	option cache_ttl '20'
+	# manual refresh throttle (seconds)
+	option force_throttle '10'
+	# a disconnect shorter than this is treated as measurement error: the
+	# online/connection timer keeps running instead of restarting
+	option session_grace '60'
+	# Informational only: annotate a station silent longer than this many
+	# SECONDS (power-save hint). It never marks a client offline.
+	option stale_after '300'
+	option detail_level 'full'
+	option key '/etc/opshare/id_dropbear'
+	option token ''
+	option timeout '8'
+	option public_data '0'
+	# UI defaults (can be overridden per browser in the page itself)
+	option refresh_ms '10000'
+	# offline clients are allowed but always sorted to the very bottom
+	option show_offline '1'
+	option realtime '0'
+	# Interface traffic: cumulative RX/TX bytes taken straight from
+	# /proc/net/dev, plus the delta between two timestamped snapshots.
+	# No bps, no chart, no history - one previous snapshot in RAM only.
+	# A reset / reboot / 32-bit rollover / clock jump is detected and flagged.
+	option traffic_enable '1'
+	option hub_host ''
+	option hub_token ''
+	option hub_transport 'http'
+
+# Custom device names (matched by MAC, shared with every node).
+# config alias 'livingroom_tv'
+#	option mac 'aa:bb:cc:dd:ee:ff'
+#	option name '客厅电视'
+#	option note '小米盒子'
+
+# Plain routers / switches that cannot run this plugin (no shell, no ubus).
+# Declare them so the topology draws them as unmanaged (dashed) nodes instead
+# of silently hiding them. `uplink` is a peer section name or a LAN IP.
+# config external 'xiaomi_ap'
+#	option name '客厅硬路由'
+#	option uplink 'immortalwrt'
+#	option note 'AP 模式；只能由上级 DHCP/ARP 看到终端，无无线详情'
+#	option clients '6'
+
+# Example peer - add as many as you like. Leave `role` empty / 'auto' to use
+# whatever the peer itself chose; set it here only to force an override.
+# config peer 'bedroom'
+#	option enabled '1'
+#	option name ''
+#	option role 'auto'
+#	option color ''
+#	option host '192.168.1.2'
+#	option user 'root'
+#	option port '22'
+#	option transport 'ssh'     # or 'http' (uses token + http_port)
+#	option key '/etc/opshare/id_dropbear'
+#	option token ''
+#	option http_port '80'
+#	option push '1'

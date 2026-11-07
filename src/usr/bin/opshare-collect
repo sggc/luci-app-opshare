@@ -1,0 +1,739 @@
+#!/bin/sh
+# opshare-collect v5 - emit ONE node snapshot as JSON on stdout.
+#
+# Portable across OpenWrt-like firmwares and wifi drivers. Station sources are
+# tried in order (first one returning rows wins):
+#   iwinfo ubus -> hostapd ubus -> iwinfo text -> iw station dump -> Broadcom wl
+#
+# v5 traffic: NO rates, NO ring buffer, NO charts. Only the interface's own
+#   cumulative RX/TX byte counters plus the delta between two timestamped
+#   snapshots. Counter resets / reboots / clock jumps are detected and flagged
+#   so a delta is never a negative or absurd number.
+# Other v3/v4 features: continuous online sessions with a grace period,
+#   fork-light collection, sharded (--step) scheduling, neutral role advice.
+# v5.1 online rule: a wireless station present in the driver association list
+#   with a valid signal is ONLINE. `inactive` (milliseconds since last frame)
+#   never decides offline - only a bare DHCP lease without any presence proof
+#   is treated as a stale/ghost client.
+#
+# All numeric fields are optional; consumers must tolerate missing fields.
+
+# NOTE: jshn.sh is not nounset-safe, so `set -u` must not be used here.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+export PATH
+
+RUNDIR=/tmp/opshare
+IFLIST="$RUNDIR/traffic.ifaces"
+IFKINDS="$RUNDIR/traffic.kinds"
+TSTATE="$RUNDIR/traffic.state"     # previous snapshot ONLY (one row/iface)
+TSNAP="$RUNDIR/traffic.snap"       # computed deltas, ready to become JSON
+SESS="$RUNDIR/sessions.state"
+mkdir -p "$RUNDIR" 2>/dev/null
+
+# ------------------------------------------------------------------ helpers --
+# Pure-shell fast paths: these used to fork grep/tr for every single station.
+# clean() sets CLEANED; no fork at all for the overwhelmingly common case.
+clean() {
+	case "$1" in
+		*'"'*|*'\'*|*'|'*) CLEANED=$(printf '%s' "$1" | tr -d '"\\|' | tr '\n\r\t' '   ') ;;
+		*) CLEANED=$1 ;;
+	esac
+}
+is_mac() {
+	case "$1" in
+		[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+lower() { printf '%s' "$1" | tr 'A-Z' 'a-z'; }
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# ---- counters are sampled by a dedicated, fork-minimal helper --------------
+# The counter snapshot is the ONLY thing that has to be refreshed every second
+# or two, and this script is far too expensive to start that often (it sets up
+# jshn, uci and a dozen phase files). opshare-traffic does one awk and returns
+# in ~10 ms, so the fast path simply hands over to it.
+if [ "${1:-}" = "--traffic-only" ]; then
+	exec /usr/bin/opshare-traffic
+fi
+
+# --step: run the very same collection, but yield (sleep) between phases so a
+# 0.7-1.1 s continuous CPU burst becomes several ~0.1 s blips spread over
+# several seconds. Essential for a service that runs 24/7.
+YIELD=0
+if [ "${1:-}" = "--step" ]; then
+	YIELD=$(uci -q get opshare.main.yield_sec 2>/dev/null)
+	case "$YIELD" in ''|*[!0-9]*) YIELD=1 ;; esac
+	[ "$YIELD" -ge 1 ] || YIELD=1
+	[ "$YIELD" -le 5 ] || YIELD=5
+fi
+yield() { [ "$YIELD" -ge 1 ] && sleep "$YIELD"; }
+
+JSHN=/usr/share/libubox/jshn.sh
+if [ ! -r "$JSHN" ]; then
+	echo '{"schema":2,"node":{"id":"unknown"},"radios":[],"clients":[],"leases":[],"traffic":[],"error":"jshn.sh missing"}'
+	exit 0
+fi
+. "$JSHN"
+
+# UCI config via lib/functions.sh = ONE fork for the whole config instead of
+# one fork per option. Falls back to plain uci on minimal firmwares.
+HAS_UCILIB=0
+if [ -r /lib/functions.sh ]; then
+	. /lib/functions.sh 2>/dev/null && HAS_UCILIB=1 && config_load opshare 2>/dev/null
+fi
+cfg() { # sets REPLY, no fork on normal OpenWrt
+	if [ "$HAS_UCILIB" = "1" ]; then config_get REPLY main "$1" "$2"
+	else REPLY=$(uci -q get "opshare.main.$1" 2>/dev/null); [ -n "$REPLY" ] || REPLY="$2"; fi
+}
+
+cfg name "";            NAME=$REPLY
+cfg role "auto";        ROLE=$REPLY
+cfg color "";           COLOR=$REPLY
+cfg cache_ttl 20;       CACHE_TTL=$REPLY
+cfg stale_after 300;    STALE=$REPLY
+cfg traffic_enable 1;   TRAFFIC=$REPLY
+cfg detail_level full;  DETAIL=$REPLY
+cfg mode off;           MODE=$REPLY
+cfg session_grace 60;   GRACE=$REPLY
+case "$CACHE_TTL" in ''|*[!0-9]*) CACHE_TTL=20 ;; esac
+case "$STALE" in ''|*[!0-9]*) STALE=300 ;; esac
+case "$GRACE" in ''|*[!0-9]*) GRACE=60 ;; esac
+[ "$GRACE" -ge 0 ] || GRACE=60
+
+NOW=$(date +%s)
+
+# ---- cheap cache: no stat(1) (some firmwares have no stat at all) ----------
+if [ "${OP_SHARE_FORCE:-0}" != "1" ] && [ "$YIELD" = "0" ] && [ -s "$RUNDIR/self.json" ]; then
+	_mt=0
+	[ -r "$RUNDIR/self.ts" ] && IFS= read -r _mt < "$RUNDIR/self.ts"
+	case "$_mt" in ''|*[!0-9]*) _mt=0 ;; esac
+	if [ "$_mt" -gt 0 ] && [ $((NOW - _mt)) -lt "$CACHE_TTL" ]; then
+		cat "$RUNDIR/self.json"
+		exit 0
+	fi
+fi
+
+TMP=$(mktemp -d /tmp/opshare-collect.XXXXXX 2>/dev/null) || TMP="$RUNDIR/collect.$$"
+mkdir -p "$TMP" 2>/dev/null
+trap 'rm -rf "$TMP"' EXIT INT TERM
+
+IFACES="$TMP/ifaces"        # ifname|ssid|band|channel|freq|htmode|bssid
+CLIENTS="$TMP/clients"      # 17 pipe-separated station fields (see emit_sta)
+IDENT="$TMP/ident"          # mac|ip|hostname|via
+LEASES="$TMP/leases"        # mac|ip|hostname|expires
+PRESENCE="$TMP/presence"    # mac|evidence
+PORTS="$TMP/ports"          # mac|physical_port
+PORTSPEED="$TMP/portspeed"  # port|speed|duplex|carrier
+IPV6="$TMP/ipv6"            # mac|address|state
+# Read the snapshot that --traffic-only maintains; never recompute it here.
+TRAFFIC_LINES="$TSNAP"
+SESSIONS="$TMP/sessions.new"
+: > "$IFACES"; : > "$CLIENTS"; : > "$IDENT"; : > "$LEASES"; : > "$PRESENCE"
+: > "$PORTS"; : > "$PORTSPEED"; : > "$IPV6"; : > "$SESSIONS"
+
+# Bridge/WAN device names must be known BEFORE neighbour lookups.
+BRDEV=$(uci -q get network.lan.device 2>/dev/null)
+[ -n "$BRDEV" ] || BRDEV=br-lan
+WANDEV=$(uci -q get network.wan.device 2>/dev/null)
+dhcp_ignore=$(uci -q get dhcp.lan.ignore 2>/dev/null)
+[ "$dhcp_ignore" = "1" ] && DHCPMODE=off || DHCPMODE=server
+
+chan2freq() {
+	awk -v c="$1" -v b="$2" 'BEGIN { c += 0;
+		if (b ~ /6g/) printf "%d", 5955 + (c-1)*5;
+		else if (b ~ /5g/) printf "%d", 5000 + c*5;
+		else if (c >= 1 && c <= 14) printf "%d", 2407 + c*5;
+		else printf "0"; }'
+}
+band_from_freq() {
+	awk -v f="$1" 'BEGIN { f += 0;
+		if (f >= 5925) print "6g"; else if (f >= 5000) print "5g"; else print "2g"; }'
+}
+
+# ------------------------------------------------------------- radios ------
+collect_radios_ubus() {
+	ws=$(ubus call network.wireless status 2>/dev/null) || return 1
+	[ -n "$ws" ] || return 1
+	json_load "$ws" 2>/dev/null || return 1
+	json_get_keys RADIOS
+	[ -n "${RADIOS:-}" ] || return 1
+	for r in $RADIOS; do
+		json_select "$r" 2>/dev/null || continue
+		band=; channel=; htmode=; hwmode=; freq=
+		json_select config 2>/dev/null && {
+			json_get_var band band; json_get_var channel channel
+			json_get_var htmode htmode; json_get_var hwmode hwmode
+			json_get_var freq frequency
+			json_select ..
+		}
+		[ -z "$band" ] && case "$hwmode" in
+			11a|11ac*|11ax*|11be*) band=5g ;; 11b|11g|11n) band=2g ;; esac
+		[ -z "$freq" ] || [ "$freq" = "0" ] && freq=$(chan2freq "$channel" "$band")
+		json_select interfaces 2>/dev/null || { json_select ..; continue; }
+		json_get_keys IDX
+		for i in $IDX; do
+			json_select "$i" 2>/dev/null || continue
+			ifname=; ssid=; mode=
+			json_get_var ifname ifname
+			json_select config 2>/dev/null && {
+				json_get_var ssid ssid; json_get_var mode mode; json_select ..
+			}
+			json_select ..
+			[ -n "$ifname" ] || continue
+			case "${mode:-ap}" in *sta*|*adhoc*|*monitor*) continue ;; esac
+			clean "$ssid"; _ssid=$CLEANED
+			printf '%s|%s|%s|%s|%s|%s|%s\n' "$ifname" "$_ssid" \
+				"$band" "$channel" "$freq" "$htmode" "" >> "$IFACES"
+		done
+		json_select ..
+		json_select ..
+	done
+	[ -s "$IFACES" ]
+}
+
+collect_radios_fallback() {
+	if has_cmd iwinfo; then
+		iwinfo 2>/dev/null | grep 'ESSID' | cut -d' ' -f1 | while read -r ifname; do
+			[ -n "$ifname" ] || continue
+			ssid=; freq=; channel=
+			info=$(ubus call iwinfo info "{\"device\":\"$ifname\"}" 2>/dev/null)
+			if [ -n "$info" ] && json_load "$info" 2>/dev/null; then
+				json_get_var ssid ssid; json_get_var freq frequency; json_get_var channel channel
+			fi
+			[ -z "$freq" ] && freq=$(chan2freq "$channel" "")
+			clean "$ssid"; _ssid=$CLEANED
+			printf '%s|%s|%s|%s|%s|%s|%s\n' "$ifname" "$_ssid" \
+				"$(band_from_freq "$freq")" "$channel" "$freq" "" "" >> "$IFACES"
+		done
+	fi
+	[ -s "$IFACES" ]
+}
+collect_radios_ubus || collect_radios_fallback
+yield   # ---- phase 1 done: radios ----
+
+# ----------------------------------------------------------- identities ----
+if [ -r /tmp/dhcp.leases ]; then
+	awk 'NF >= 4 { print tolower($2) "|" $3 "|" ($4 == "*" ? "" : $4) "|dhcp" }' \
+		/tmp/dhcp.leases > "$LEASES"
+	cat "$LEASES" >> "$IDENT"
+fi
+[ -r /etc/ethers ] && awk '!/^[ \t]*#/ && NF >= 2 { print tolower($1) "||" $2 "|ethers" }' \
+	/etc/ethers >> "$IDENT"
+
+if has_cmd ip; then
+	ip -4 neigh show dev "$BRDEV" 2>/dev/null | awk -v PF="$PRESENCE" '{
+		ip4 = $1; m = "";
+		for (i = 1; i <= NF; i++) if ($i == "lladdr") { m = tolower($(i+1)); break }
+		if (m ~ /:/ && $NF !~ /INCOMPLETE|FAILED|none/) {
+			print m "|" ip4 "||neigh"; print m "|neigh" > PF
+		}
+	}' >> "$IDENT"
+else
+	awk -v PF="$PRESENCE" -v BD="$BRDEV" 'NR > 1 && $3 == "0x2" && $4 != "00:00:00:00:00:00" && $6 == BD {
+		m = tolower($4); print m "|" $1 "||arp"; print m "|arp" > PF
+	}' /proc/net/arp >> "$IDENT"
+fi
+
+# ---- bridge forwarding database: MAC -> physical LAN port ------------------
+if has_cmd bridge; then
+	bridge fdb show 2>/dev/null | awk -v PF="$PRESENCE" \
+		'$2 == "dev" && $1 ~ /^[0-9A-Fa-f][0-9A-Fa-f]:/ && $1 !~ /^(33:33|01:00:5e)/ \
+		 && $0 !~ /permanent|self/ {
+			m = tolower($1); print m "|" $3; print m "|fdb" > PF
+		}' >> "$PORTS"
+elif has_cmd brctl && [ -d "/sys/class/net/$BRDEV/brif" ]; then
+	: > "$TMP/portmap"
+	for p in /sys/class/net/"$BRDEV"/brif/*; do
+		[ -d "$p" ] || continue
+		no=$(cat "$p/port_no" 2>/dev/null)
+		[ -n "$no" ] || continue
+		printf '%d|%s\n' "$((no))" "$(basename "$p")" >> "$TMP/portmap"
+	done
+	brctl showmacs "$BRDEV" 2>/dev/null | awk \
+		'NR > 1 && $2 ~ /:/ && $3 == "no" { print $1 "|" tolower($2) }' > "$TMP/brctlmacs"
+	awk -F'|' -v PF="$PRESENCE" -v PM="$TMP/portmap" '
+		BEGIN { while ((getline l < PM) > 0) { split(l, a, "|"); map[a[1]] = a[2] } }
+		($1 in map) { print $2 "|" map[$1]; print $2 "|fdb" > PF }' \
+		"$TMP/brctlmacs" >> "$PORTS"
+fi
+
+# ---- physical port link speed / duplex (cached 60 s, no stat(1)) -----------
+PSCACHE="$RUNDIR/portspeed.cache"
+PSTS="$RUNDIR/portspeed.ts"
+_pst=0
+[ -r "$PSTS" ] && IFS= read -r _pst < "$PSTS"
+case "$_pst" in ''|*[!0-9]*) _pst=0 ;; esac
+if [ -s "$PSCACHE" ] && [ "$_pst" -gt 0 ] && [ $((NOW - _pst)) -lt 60 ]; then
+	cp "$PSCACHE" "$PORTSPEED"
+else
+	for p in $(ls /sys/class/net/"$BRDEV"/brif/ 2>/dev/null) $WANDEV; do
+		[ -n "$p" ] && [ -d "/sys/class/net/$p" ] || continue
+		sp=$(cat "/sys/class/net/$p/speed" 2>/dev/null)
+		du=$(cat "/sys/class/net/$p/duplex" 2>/dev/null)
+		ca=$(cat "/sys/class/net/$p/carrier" 2>/dev/null)
+		[ "$sp" = "-1" ] && sp=
+		if [ -z "$sp" ] && has_cmd ethtool; then
+			eout=$(ethtool "$p" 2>/dev/null)
+			sp=$(printf '%s' "$eout" | sed -n 's/.*Speed: \([0-9][0-9]*\)Mb\/s.*/\1/p' | head -1)
+			du=$(printf '%s' "$eout" | sed -n 's/.*Duplex: \([A-Za-z]*\).*/\1/p' | head -1)
+			ca=$(printf '%s' "$eout" | sed -n 's/.*Link detected: \([a-z]*\).*/\1/p' | head -1)
+		fi
+		printf '%s|%s|%s|%s\n' "$p" "$sp" "$du" "$ca" >> "$PORTSPEED"
+	done
+	cp "$PORTSPEED" "$PSCACHE" 2>/dev/null
+	printf '%s\n' "$NOW" > "$PSTS"
+fi
+
+# ---- IPv6 -----------------------------------------------------------------
+if has_cmd ip; then
+	ip -6 neigh show dev "$BRDEV" 2>/dev/null | awk '{
+		a6 = $1; m = "";
+		for (i = 1; i <= NF; i++) if ($i == "lladdr") { m = tolower($(i+1)); break }
+		if (m ~ /:/ && $NF !~ /INCOMPLETE|FAILED/) print m "|" a6 "|" $NF
+	}' >> "$IPV6"
+fi
+if [ "$DETAIL" = "full" ] && has_cmd ubus; then
+	ubus call dhcp ipv6leases 2>/dev/null | awk '
+		/"duid"/ {
+			d = $0; gsub(/.*"duid"[[:space:]]*:[[:space:]]*"/, "", d); gsub(/".*/, "", d);
+			mac = "";
+			if (length(d) >= 12) {
+				h = substr(d, length(d)-11, 12);
+				if (h ~ /^[0-9A-Fa-f]+$/ && length(h) == 12)
+					mac = tolower(substr(h,1,2) ":" substr(h,3,2) ":" substr(h,5,2) ":" substr(h,7,2) ":" substr(h,9,2) ":" substr(h,11,2));
+			}
+			next;
+		}
+		/"address"/ && mac != "" {
+			a = $0; gsub(/.*"address"[[:space:]]*:[[:space:]]*"/, "", a); gsub(/".*/, "", a);
+			print mac "|" a "|dhcpv6";
+		}' >> "$IPV6"
+fi
+yield   # ---- phase 2 done: identities / ports / IPv6 ----
+
+# ------------------------------------------------------------- stations ----
+STACOUNT=0
+emit_sta() { # mac if ssid band sig sigavg noise inactive ctime rx tx rxmhz txmhz mcs nss he source
+	is_mac "$1" || return 0
+	STACOUNT=$((STACOUNT + 1))
+	clean "$2"; _c2=$CLEANED
+	clean "$3"; _c3=$CLEANED
+	clean "$4"; _c4=$CLEANED
+	printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+		"$1" "$_c2" "$_c3" "$_c4" \
+		"$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" \
+		"${14}" "${15}" "${16}" "${17}" >> "$CLIENTS"
+}
+
+stations_iwinfo_ubus() {
+	local out mac sig sigavg noise inactive ctime rxrate txrate rxmhz txmhz mcs nss he
+	out=$(ubus call iwinfo assoclist "{\"device\":\"$1\"}" 2>/dev/null) || return 1
+	[ -n "$out" ] || return 1
+	json_load "$out" 2>/dev/null || return 1
+	json_select results 2>/dev/null || return 1
+	json_get_keys KS
+	[ -n "${KS:-}" ] || return 1
+	for k in $KS; do
+		json_select "$k" 2>/dev/null || continue
+		mac=; sig=; sigavg=; noise=; inactive=; ctime=
+		json_get_var mac mac; json_get_var sig signal; json_get_var sigavg signal_avg
+		json_get_var noise noise; json_get_var inactive inactive; json_get_var ctime connected_time
+		rxrate=; rxmhz=; txrate=; txmhz=; mcs=; nss=; he=-
+		json_select rx 2>/dev/null && { json_get_var rxrate rate; json_get_var rxmhz mhz; json_select ..; }
+		json_select tx 2>/dev/null && {
+			json_get_var txrate rate; json_get_var txmhz mhz
+			json_get_var mcs mcs; json_get_var nss nss; json_get_var he he
+			json_select ..
+		}
+		[ "$he" = "1" ] && he=1 || he=-
+		emit_sta "$mac" "$1" "$2" "$3" "$sig" "$sigavg" "$noise" "$inactive" \
+			"$ctime" "$rxrate" "$txrate" "$rxmhz" "$txmhz" "$mcs" "$nss" "$he" "iwinfo-ubus"
+		json_select ..
+	done
+}
+
+stations_hostapd_ubus() {
+	local out mac sig sigavg noise inactive ctime rxrate txrate rxmhz txmhz mcs nss he freq b
+	out=$(ubus call "hostapd.$1" get_clients 2>/dev/null) || return 1
+	[ -n "$out" ] || return 1
+	json_load "$out" 2>/dev/null || return 1
+	json_get_var freq freq
+	[ -n "$freq" ] && [ "$freq" != "0" ] && b=$(band_from_freq "$freq") || b="$3"
+	json_select clients 2>/dev/null || return 1
+	json_get_keys KS
+	[ -n "${KS:-}" ] || return 1
+	for k in $KS; do
+		mac=$(printf '%s' "$k" | sed 's/_/:/g')
+		json_select "$k" 2>/dev/null || continue
+		sig=; sigavg=; noise=; inactive=; ctime=
+		json_get_var sig signal; json_get_var sigavg signal_avg; json_get_var noise noise
+		json_get_var inactive inactive; json_get_var ctime connected_time
+		rxrate=; rxmhz=; txrate=; txmhz=; mcs=; nss=; he=-
+		json_select rx 2>/dev/null && {
+			json_get_var rxrate rate; json_get_var rxmhz mhz; json_get_var mcs mcs; json_select ..; }
+		json_select tx 2>/dev/null && {
+			json_get_var txrate rate; json_get_var txmhz mhz
+			json_get_var mcs mcs; json_get_var nss nss; json_get_var he he; json_select ..; }
+		[ "$he" = "1" ] && he=1 || he=-
+		emit_sta "$mac" "$1" "$2" "$b" "$sig" "$sigavg" "$noise" "$inactive" \
+			"$ctime" "$rxrate" "$txrate" "$rxmhz" "$txmhz" "$mcs" "$nss" "$he" "hostapd-ubus"
+		json_select ..
+	done
+}
+
+stations_iwinfo_text() {
+	has_cmd iwinfo || return 1
+	iwinfo "$1" assoclist 2>/dev/null | awk -v IF="$1" -v SSID="$2" -v BAND="$3" '
+	function flush() {
+		if (mac != "") printf "%s|%s|%s|%s|%s|-|-|-|-|%s|%s|%s|%s|%s|%s|-|iwinfo-text\n", tolower(mac), IF, SSID, BAND, sig, rx, tx, rxmhz, txmhz, mcs, nss;
+		mac=""; sig="-"; rx="-"; tx="-"; rxmhz="-"; txmhz="-"; mcs="-"; nss="-";
+	}
+	/^[[:space:]]*[0-9A-Fa-f][0-9A-Fa-f]:/ { flush(); mac=$1; sig=$2; next }
+	/RX:/ { for(i=1;i<=NF;i++) if ($i ~ /MBit\/s/) { rx=int($(i-1)*1000); break }
+		if (match($0, /[0-9]+MHz/)) rxmhz=substr($0,RSTART,RLENGTH)+0; next }
+	/TX:/ { for(i=1;i<=NF;i++) if ($i ~ /MBit\/s/) { tx=int($(i-1)*1000); break }
+		if (match($0, /[0-9]+MHz/)) txmhz=substr($0,RSTART,RLENGTH)+0;
+		if (match($0, /MCS[ ]+[0-9]+/)) { s=substr($0,RSTART,RLENGTH); gsub(/[^0-9]/,"",s); mcs=s+0 }
+		if (match($0, /NSS[ ]+[0-9]+/)) { s=substr($0,RSTART,RLENGTH); gsub(/[^0-9]/,"",s); nss=s+0 }
+		next }
+	END { flush() }' >> "$CLIENTS"
+}
+
+stations_iw_dump() {
+	has_cmd iw || return 1
+	iw dev "$1" station dump 2>/dev/null | awk -v IF="$1" -v SSID="$2" -v BAND="$3" '
+	function flush() {
+		if (mac != "") printf "%s|%s|%s|%s|%s|-|-|%s|%s|%s|%s|-|-|-|-|-|iw-dump\n", tolower(mac), IF, SSID, BAND, sig, inactive, ctime, rx, tx;
+		mac=""; sig="-"; inactive="-"; ctime="-"; rx="-"; tx="-";
+	}
+	/^Station / { flush(); mac=$2; next }
+	/signal:/ { sig=$2; next }
+	/inactive time:/ { inactive=$3; next }
+	/connected time:/ { ctime=$3; next }
+	/rx bitrate:/ { rx=$3*1000; next }
+	/tx bitrate:/ { tx=$3*1000; next }
+	END { flush() }' >> "$CLIENTS"
+}
+
+stations_wl() {
+	has_cmd wl || return 1
+	for mac in $(wl -i "$1" assoclist 2>/dev/null | awk '{print $1}'); do
+		is_mac "$mac" || continue
+		sig=$(wl -i "$1" rssi "$mac" 2>/dev/null | grep -oE -- '-?[0-9]+' | head -1)
+		[ -n "$sig" ] || sig=-
+		emit_sta "$mac" "$1" "$2" "$3" "$sig" "-" "-" "-" "-" \
+			"-" "-" "-" "-" "-" "-" "-" "wl"
+	done
+}
+
+while IFS='|' read -r ifname ssid band channel freq htmode bssid; do
+	[ -n "$ifname" ] || continue
+	before=$STACOUNT
+	stations_iwinfo_ubus "$ifname" "$ssid" "$band" 2>/dev/null
+	[ "$STACOUNT" -gt "$before" ] || stations_hostapd_ubus "$ifname" "$ssid" "$band" 2>/dev/null
+	if [ "$STACOUNT" -le "$before" ]; then
+		stations_iwinfo_text "$ifname" "$ssid" "$band" 2>/dev/null
+		STACOUNT=$(wc -l < "$CLIENTS")
+	fi
+	if [ "$STACOUNT" -le "$before" ]; then
+		stations_iw_dump "$ifname" "$ssid" "$band" 2>/dev/null
+		STACOUNT=$(wc -l < "$CLIENTS")
+	fi
+	[ "$STACOUNT" -gt "$before" ] || stations_wl "$ifname" "$ssid" "$band" 2>/dev/null
+done < "$IFACES"
+
+sort -u "$CLIENTS" > "$TMP/clients.u" 2>/dev/null && mv "$TMP/clients.u" "$CLIENTS"
+cut -d'|' -f1 "$CLIENTS" | sort -u > "$TMP/wmac"
+sed 's/$/|wifi/' "$TMP/wmac" >> "$PRESENCE"
+
+awk -F'|' -v W="$TMP/wmac" '
+	BEGIN { while ((getline l < W) > 0) w[tolower(l)] = 1 }
+	!($1 in w) && $1 != "" { print $1 }' "$IDENT" | sort -u > "$TMP/wiredmacs"
+while read -r mac; do
+	[ -n "$mac" ] || continue
+	printf '%s|||||-|-|-|-|-|-|-|-|-|-|-|wired\n' "$mac" >> "$CLIENTS"
+done < "$TMP/wiredmacs"
+yield   # ---- phase 3 done: stations ----
+
+# ------------------------------------------------------------- traffic -----
+# Only rebuild the interface list (wifi interfaces come and go). The counter
+# snapshot itself is maintained by --traffic-only on an even cadence; in
+# --step mode this phase merely READS the file - no extra computation at all.
+if [ "$TRAFFIC" = "1" ]; then
+	WIFIS=$(cut -d'|' -f1 "$IFACES" | tr '\n' ' ')
+	BRPORTS=$(ls /sys/class/net/"$BRDEV"/brif/ 2>/dev/null | tr '\n' ' ')
+	: > "$IFLIST"; : > "$IFKINDS"
+	for i in $(printf '%s\n' $WANDEV $BRDEV $WIFIS $BRPORTS | sed '/^$/d' | sort -u); do
+		case "$i" in
+			lo|sit*|dummy*|ifb*|teql*|apcli*|oam*|omci*|gre*|tun*|vpn*|docker*) continue ;;
+		esac
+		[ -d "/sys/class/net/$i" ] || continue
+		case "$i" in
+			"$WANDEV") k=wan ;;
+			"$BRDEV")  k=lan ;;
+			*) case " $WIFIS " in *" $i "*) k=wifi ;; *) k=port ;; esac ;;
+		esac
+		printf '%s\n' "$i" >> "$IFLIST"
+		printf '%s|%s\n' "$i" "$k" >> "$IFKINDS"
+	done
+	# A manual one-shot collection (not --step) has no sampler behind it.
+	[ "$YIELD" = "0" ] && /usr/bin/opshare-traffic
+fi
+yield   # ---- phase 4 done: read interface snapshot ----
+
+# ----------------------------------------------------------- node facts -----
+hostname=$(uci -q get system.@system[0].hostname 2>/dev/null)
+if [ -z "$hostname" ] && [ -r /proc/sys/kernel/hostname ]; then
+	IFS= read -r hostname < /proc/sys/kernel/hostname
+fi
+[ -n "$hostname" ] || hostname=OpenWrt
+[ -n "$NAME" ] || NAME="$hostname"
+
+model=; kernel=; dist=; version=; desc=; target=
+board=$(ubus call system board 2>/dev/null)
+if [ -n "$board" ] && json_load "$board" 2>/dev/null; then
+	json_get_var model model; json_get_var kernel kernel
+	json_select release 2>/dev/null && {
+		json_get_var dist distribution; json_get_var version version
+		json_get_var desc description; json_get_var target target; json_select ..
+	}
+fi
+. /etc/openwrt_release 2>/dev/null
+[ -n "$dist" ]    || dist="${DISTRIB_ID:-OpenWrt}"
+[ -n "$version" ] || version="${DISTRIB_RELEASE:-}"
+[ -n "$desc" ]    || desc="${DISTRIB_DESCRIPTION:-}"
+[ -n "$target" ]  || target="${DISTRIB_TARGET:-}"
+
+lan_ip=$(uci -q get network.lan.ipaddr 2>/dev/null)
+wan_ip=; lan6=; wan6=
+if has_cmd ubus; then
+	st=$(ubus call network.interface.wan status 2>/dev/null)
+	if [ -n "$st" ] && json_load "$st" 2>/dev/null; then
+		json_select ipv4-address >/dev/null 2>&1 && {
+			json_select 1 >/dev/null 2>&1 && { json_get_var wan_ip address; json_select ..; }; json_select ..; }
+	fi
+fi
+if has_cmd ip; then
+	ip -6 addr show scope global 2>/dev/null | awk -v BR="$BRDEV" -v WAN="$WANDEV" '
+		/^[0-9]+: / { dev = $2; sub(/:$/, "", dev); next }
+		/^[[:space:]]*inet6 / {
+			a = $2; sub(/\/.*/, "", a);
+			if (dev == BR && lan == "") lan = a;
+			if (dev == WAN && wan == "") wan = a;
+		}
+		END { print lan "|" wan }' > "$TMP/v6"
+	IFS='|' read -r lan6 wan6 < "$TMP/v6"
+fi
+uptime=; load=; mem_total=; mem_free=
+if [ -r /proc/uptime ]; then IFS=' ' read -r uptime _rest < /proc/uptime; uptime=${uptime%%.*}; fi
+if [ -r /proc/loadavg ]; then
+	IFS=' ' read -r _l1 _l2 _l3 _rest < /proc/loadavg
+	load="$_l1 $_l2 $_l3"
+fi
+if [ -r /proc/meminfo ]; then
+	while IFS=' ' read -r _mk _mv _mr; do
+		case "$_mk" in
+			MemTotal:) mem_total=$_mv ;;
+			MemAvailable:) mem_free=$_mv ;;
+		esac
+	done < /proc/meminfo
+fi
+
+# ---- role: a FREE label, auto-detection is only a hint ---------------------
+# The network topology does NOT decide who is "master" (an upstream router may
+# be a plain member while a downstream box does the aggregation). We therefore
+# only produce a neutral *suggestion*; the displayed role always comes from
+# the user's own setting. Unset -> neutral "node", no master/slave assumption.
+if [ "$DHCPMODE" = "off" ] && [ -d "/sys/class/net/$BRDEV/brif" ]; then
+	SUGGEST=bridge; BASIS="建议：DHCP 关闭 + LAN 桥接（dumb AP）"
+elif [ "$MODE" = "hub" ]; then
+	SUGGEST=aggregator; BASIS="建议：本节点负责汇聚全部数据（mode=hub）"
+elif [ "$MODE" = "pull" ]; then
+	SUGGEST=member; BASIS="建议：主动拉取合并视图（mode=pull）"
+else
+	SUGGEST=member; BASIS="建议：被汇聚 / 被动节点（mode=off）"
+fi
+if [ -z "$ROLE" ] || [ "$ROLE" = "auto" ]; then
+	ROLE=node; ROLE_SOURCE=auto
+	BASIS="$BASIS · 未设置角色，显示中性「节点」；可在页面自由设置"
+else
+	ROLE_SOURCE=config
+	BASIS="已自由设置：$ROLE（自动建议仅供参考：$SUGGEST）"
+fi
+
+yield   # ---- phase 5 done: node facts ----
+
+# ------------------------------------------------------------- output ------
+add_num() { case "$2" in ''|'-'|*[!0-9-]*) return 0 ;; esac; json_add_int "$1" "$2"; }
+add_str() { [ -n "$2" ] || return 0; clean "$2"; json_add_string "$1" "$CLEANED"; }
+
+json_init
+json_add_int schema 2
+json_add_object node
+add_str id "$NAME"; add_str hostname "$hostname"; add_str model "$model"
+add_str distribution "$dist"; add_str version "$version"; add_str description "$desc"
+add_str target "$target"; add_str kernel "$kernel"
+add_str role "$ROLE"; add_str role_basis "$BASIS"; add_str suggested_role "$SUGGEST"
+add_str role_source "$ROLE_SOURCE"; add_str color "$COLOR"; add_str dhcp "$DHCPMODE"
+add_str lan_ip "$lan_ip"; add_str wan_ip "$wan_ip"
+add_str lan_ipv6 "$lan6"; add_str wan_ipv6 "$wan6"
+add_str load "$load"
+add_num uptime "$uptime"; add_num mem_total "$mem_total"; add_num mem_free "$mem_free"
+add_num session_grace "$GRACE"
+json_add_int time "$NOW"
+json_close_object
+
+json_add_array radios
+while IFS='|' read -r ifname ssid band channel freq htmode bssid; do
+	[ -n "$ifname" ] || continue
+	json_add_object
+	add_str ifname "$ifname"; add_str ssid "$ssid"; add_str band "$band"
+	add_str htmode "$htmode"; add_str bssid "$bssid"
+	add_num channel "$channel"; add_num freq "$freq"
+	json_close_object
+done < "$IFACES"
+json_close_array
+
+# Join all lookup tables + presence/online judgement + session tracking in ONE
+# awk process. Sessions survive short gaps (<= GRACE seconds) so a roaming
+# client or a brief node/link dropout does not reset the connection timer.
+awk -F'|' -v IDF="$IDENT" -v PTF="$PORTS" -v PSF="$PORTSPEED" \
+	-v V6F="$IPV6" -v PRF="$PRESENCE" -v SF="$SESS" -v SNEW="$SESSIONS" \
+	-v NOW="$NOW" -v GRACE="$GRACE" -v STALE="$STALE" '
+BEGIN {
+	while ((getline l < IDF) > 0) {
+		split(l, a, "|"); k = tolower(a[1]);
+		if (!(k in ipm)) { ipm[k] = a[2]; hnm[k] = a[3]; viam[k] = a[4] }
+	}
+	while ((getline l < PTF) > 0) { split(l, a, "|"); portm[tolower(a[1])] = a[2] }
+	while ((getline l < PSF) > 0) { split(l, a, "|"); spm[a[1]] = a[2]; dum[a[1]] = a[3]; cam[a[1]] = a[4] }
+	while ((getline l < PRF) > 0) { split(l, a, "|"); evm[tolower(a[1])] = a[2] }
+	while ((getline l < V6F) > 0) {
+		split(l, a, "|"); k = tolower(a[1]);
+		if (a[2] !~ /^fe80:/ && ng[k] < 3) { g6[k] = (g6[k] ? g6[k] "," : "") a[2]; ng[k]++ }
+		if (na[k] < 2) { a6[k] = (a6[k] ? a6[k] "," : "") a[2]; na[k]++ }
+	}
+	while ((getline l < SF) > 0) {
+		split(l, a, "|"); st[a[1]] = a[2]+0; ls[a[1]] = a[3]+0; sl[a[1]] = (a[4]+0 == 1)
+	}
+	close(SF)
+	KEEP = GRACE * 2 + 600;
+	OFS = "|";
+}
+{
+	mac = tolower($1); $1 = mac;   # normalise MAC before echoing $0
+	# MediaTek mtwifi (and some vendor blobs) put garbage in the rx/tx mhz
+	# fields, e.g. 13076 / 13216. Only real 802.11 channel widths are kept;
+	# when one direction is bogus we borrow the other one.
+	if ($12 !~ /^(20|40|80|160|320|10|5)$/) $12 = "";
+	if ($13 !~ /^(20|40|80|160|320|10|5)$/) $13 = "";
+	if ($12 == "" && $13 != "") $12 = $13;
+	if ($13 == "" && $12 != "") $13 = $12;
+	host = tolower(hnm[mac]); src = $17; sig = $5;
+	inactive = $8; ctime = $9; ev = evm[mac]; p = portm[mac];
+	v6 = (mac in g6) ? g6[mac] : ((mac in a6) ? a6[mac] : "");
+
+	# `inactive` is NL80211_STA_INFO_INACTIVE_TIME in MILLISECONDS (iw confirms
+	# "inactive time: 20 ms"). Phones in power-save routinely go silent for
+	# hundreds of ms, so comparing it to a seconds threshold produced random
+	# false "offline" rows for clients that were actively associated.
+	idle = 0;
+	if (inactive ~ /^[0-9]+$/) idle = int((inactive+0) / 1000);
+	online = 0; reason = "";
+	if (src == "wired") {
+		# No association at all: a bare DHCP lease needs real presence proof.
+		if (ev != "") online = 1; else reason = "仅 DHCP 租约（设备已离开）";
+	} else if (sig == "" || sig == "-" || sig ~ /[^0-9-]/ || (sig+0) >= 0) {
+		reason = "关联残留 / 无信号";
+	} else {
+		# Presence in the driver association list WITH a valid signal IS the
+		# online proof. A driver drops the entry shortly after a real disconnect.
+		online = 1;
+		# Long silence is only an informational hint, never an offline verdict.
+		if (idle > STALE) reason = "静默 " idle " 秒（省电中，仍在线）";
+	}
+
+	k1 = "m:" mac;
+	k2 = (host != "" && host != "*") ? "h:" host : "";
+	best = 0; gap = 0;
+	if (k1 in st) { g = NOW - ls[k1]; if (g >= 0 && g <= GRACE) { best = st[k1]; gap = g } }
+	if (k2 != "" && (k2 in st)) {
+		g = NOW - ls[k2];
+		if (g >= 0 && g <= GRACE) { if (best == 0 || st[k2] < best) best = st[k2]; if (g > gap) gap = g }
+	}
+	base = (ctime ~ /^[0-9]+$/) ? ctime+0 : 0;
+	if (best == 0) best = NOW - base;
+	else if (base > NOW - best) best = NOW - base;
+	secs = NOW - best; if (secs < 0) secs = 0;
+	# A "bridged dropout" only counts when the client was ABSENT at the
+	# previous sample. A normal 30 s polling interval is not a dropout.
+	prevSeen = (sl[k1] ? 1 : 0);
+	if (k2 != "" && sl[k2]) prevSeen = 1;
+	gapflag = (online && best != 0 && gap > 0 && !prevSeen) ? 1 : 0;
+	if (online) {
+		seen[k1] = 1; st[k1] = best; ls[k1] = NOW;
+		if (k2 != "") { seen[k2] = 1; st[k2] = best; ls[k2] = NOW }
+	}
+	print $0 "|" ipm[mac] "|" hnm[mac] "|" viam[mac] "|" p "|" spm[p] "|" dum[p] "|" cam[p] "|" v6 "|" evm[mac] "|" \
+		online "|" reason "|" int(best) "|" int(secs) "|" (gapflag ? int(gap) : 0) "|" gapflag;
+}
+END {
+	for (k in st) if (seen[k] || (NOW - ls[k]) <= KEEP)
+		print k "|" st[k] "|" ls[k] "|" (seen[k] ? 1 : 0) > SNEW;
+	close(SNEW)
+}' "$CLIENTS" > "$TMP/enriched"
+[ -s "$SESSIONS" ] && mv "$SESSIONS" "$SESS"
+
+json_add_array clients
+while IFS='|' read -r mac ifname ssid band sig sigavg noise inactive ctime \
+	rxrate txrate rxmhz txmhz mcs nss he source ip hostn via port p_sp p_du p_ca v6 evidence \
+	online reason sess_start sess_secs sess_gap sess_grace; do
+	[ -n "$mac" ] || continue
+	if [ "$source" = "wired" ]; then ctype=wired; else ctype=wifi; fi
+	json_add_object
+	add_str mac "$mac"; add_str ifname "$ifname"; add_str ssid "$ssid"; add_str band "$band"
+	add_str ip "$ip"; add_str hostname "$hostn"; add_str identity_source "$via"
+	add_str source "$source"; add_str type "$ctype"
+	add_str port "$port"; add_str port_speed "$p_sp"; add_str port_duplex "$p_du"
+	add_str port_carrier "$p_ca"; add_str ipv6 "$v6"; add_str presence "$evidence"
+	add_str reason "$reason"
+	json_add_int online "$online"
+	add_num signal "$sig"; add_num signal_avg "$sigavg"; add_num noise "$noise"
+	add_num inactive "$inactive"; add_num driver_connected_time "$ctime"
+	add_num connected_time "$sess_secs"; add_num session_start "$sess_start"
+	add_num session_gap "$sess_gap"; add_num session_grace_used "$sess_grace"
+	add_num rx_rate "$rxrate"; add_num tx_rate "$txrate"
+	add_num rx_mhz "$rxmhz"; add_num tx_mhz "$txmhz"
+	add_num tx_mcs "$mcs"; add_num tx_nss "$nss"; add_num he "$he"
+	json_close_object
+done < "$TMP/enriched"
+json_close_array
+
+json_add_array leases
+while IFS='|' read -r mac ip host via; do
+	[ -n "$mac" ] || continue
+	json_add_object
+	add_str mac "$mac"; add_str ip "$ip"; add_str hostname "$host"
+	json_close_object
+done < "$LEASES"
+json_close_array
+
+json_add_array traffic
+if [ "$TRAFFIC" = "1" ] && [ -s "$TRAFFIC_LINES" ]; then
+	while IFS='|' read -r tname kind rtot ttot drx dtx ts pts dt st; do
+		[ -n "$tname" ] || continue
+		json_add_object
+		add_str ifname "$tname"; add_str kind "$kind"; add_str state "$st"
+		add_num rx_total "$rtot"; add_num tx_total "$ttot"
+		add_num rx_delta "$drx"; add_num tx_delta "$dtx"
+		add_num ts "$ts"; add_num prev_ts "$pts"; add_num dt "$dt"
+		json_close_object
+	done < "$TRAFFIC_LINES"
+fi
+json_close_array
+
+json_dump > "$RUNDIR/self.json.t"
+mv "$RUNDIR/self.json.t" "$RUNDIR/self.json"
+printf '%s\n' "$NOW" > "$RUNDIR/self.ts"
+cat "$RUNDIR/self.json"

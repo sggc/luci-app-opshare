@@ -1,0 +1,38 @@
+# Build output. Rebuilt by CI and by `python packaging/build-ipk.py`.
+dist/
+
+# --- never commit these ---------------------------------------------------
+# Real credentials for the two test routers.
+_dev/devconf.json
+# Unsanitised capture from the routers: real MACs, hostnames, IPv6, SSIDs.
+# _dev/snapshot.json is the sanitised copy the UI test runs against.
+_dev/snapshot.real.json
+# A third-party .ipk kept only for format comparison.
+_dev/ref.ipk
+# Local scratch: screenshots, A/B iframe probes, release-step simulation.
+_dev/shots/
+_dev/relsim/
+_dev/edgeprof/
+_dev/edgeprof2/
+
+# The iframe A/B harness (shell.html, poke.html) is kept, but its inputs and
+# dumps are generated: page*.html come from _dev/make_preview.py, and the .txt
+# files are DOM dumps and a browser stderr log.
+_dev/iframetest/page.html
+_dev/iframetest/page_old.html
+_dev/iframetest/dom.txt
+_dev/iframetest/dom_old.txt
+_dev/iframetest/err.txt
+
+# Editor / OS noise
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+*.swp
+
+# Generated single-file preview of the UI (python _dev/make_preview.py)
+opshare-preview.html
+
+# Agent workspace data: session logs and notes, not part of the package.
+.workbuddy/

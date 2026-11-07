@@ -1,0 +1,13 @@
+#!/bin/sh
+# opshare-gw - optional forced command for the SSH key used between peers.
+# Put this in the peer's /etc/dropbear/authorized_keys, e.g.:
+#   command="/usr/bin/opshare-gw" ssh-ed25519 AAAA... opshare@hub
+# (Dropbear builds that ignore the command= option simply fall back to a
+# normal shell; the plugin still works, just with a less restricted key.)
+case "${SSH_ORIGINAL_COMMAND:-}" in
+	collect) exec /usr/bin/opshare-collect ;;
+	recv)    exec /usr/bin/opshare-recv ;;
+	all)     exec cat /tmp/opshare/all.json ;;
+	status)  echo OK ;;
+	*)       echo 'opshare: allowed commands: collect, recv, all, status' >&2; exit 1 ;;
+esac

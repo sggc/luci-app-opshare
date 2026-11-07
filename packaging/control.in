@@ -1,0 +1,13 @@
+Package: luci-app-opshare
+Version: @VERSION@
+Depends: libc, uhttpd, rpcd, jshn, luci-base
+Source: luci-app-opshare
+Section: luci
+Priority: optional
+Maintainer: opshare
+Architecture: all
+Installed-Size: @SIZE@
+Description: 多设备信息共享 - 一台路由器看到的设备，另一台也能看到
+ 零配置配对（探测网关与 DHCP 租约，HTTP 交换身份）、拓扑图、客户端列表、
+ 接口流量与 IPv6；纯 shell + 网页实现，没有任何编译产物。
+ 同一份包适用于所有 CPU 架构（Architecture: all），可提供 ubus 接口给手机 App。

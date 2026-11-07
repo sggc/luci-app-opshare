@@ -1,0 +1,25 @@
+#!/bin/sh
+# opshare-force-sync - on-demand refresh, called by the LuCI "refresh" button.
+# Throttled to at most one merge every `force_throttle` seconds (default 10)
+# so several open pages / "realtime" polling cannot overload the router.
+# This no longer runs a full collection: each node computes its own snapshot
+# on the sharded schedule, so a manual refresh costs a few file reads only.
+# Only meaningful on hub / pull nodes.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+export PATH
+
+MODE=$(uci -q get opshare.main.mode 2>/dev/null)
+case "$MODE" in hub|pull) ;; *) exit 0 ;; esac
+
+THROTTLE=$(uci -q get opshare.main.force_throttle 2>/dev/null)
+case "$THROTTLE" in ''|*[!0-9]*) THROTTLE=10 ;; esac
+[ "$THROTTLE" -ge 1 ] || THROTTLE=10
+
+mkdir -p /tmp/opshare
+TS=/tmp/opshare/force.ts
+now=$(date +%s)
+last=$(cat "$TS" 2>/dev/null)
+case "$last" in ''|*[!0-9]*) last=0 ;; esac
+[ $((now - last)) -ge "$THROTTLE" ] || exit 0
+echo "$now" > "$TS"
+OP_SHARE_FORCE=1 /usr/bin/opshare-sync --once >/dev/null 2>&1

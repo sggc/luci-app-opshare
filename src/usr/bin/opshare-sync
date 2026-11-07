@@ -1,0 +1,647 @@
+#!/bin/sh
+# opshare-sync v2 - collect local + remote snapshots and merge them.
+#
+# hub  : poll every configured peer, merge into /tmp/opshare/all.json and push
+#        the merged view back to each peer (works through NAT / dual DHCP).
+# pull : only fetch an already merged snapshot from a hub.
+# off  : do nothing; still serves the LuCI page and the CGI endpoint.
+#
+# Any number of peers is supported; each peer may use ssh or http transport.
+# Roles (master / slave / bridge) are explicit in /etc/config/opshare and are
+# purely descriptive - the data flow is defined by `mode` and `peer` sections.
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+export PATH
+. /lib/functions.sh 2>/dev/null || {
+	echo '{"schema":2,"updated":0,"nodes":[],"error":"no UCI shell lib"}' > /tmp/opshare/all.json
+	exit 1
+}
+
+RUNDIR=/tmp/opshare
+CACHE="$RUNDIR/cache"
+NODES="$RUNDIR/nodes"
+ALL="$RUNDIR/all.json"
+LIST="$RUNDIR/nodes.list"
+ALIASES="$RUNDIR/aliases.part"
+EXTERNALS="$RUNDIR/externals.part"
+mkdir -p "$CACHE" "$NODES"
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+log() { logger -t opshare "$*" 2>/dev/null || :; }
+clean() { printf '%s' "$1" | tr -d '"\\|' | tr '\n\r\t' '   '; }
+
+config_load opshare
+ENABLED=1; INTERVAL=30; MODE=hub; KEY=/etc/opshare/id_dropbear
+NODE_NAME=; TOKEN=; TIMEOUT=8; PUBLIC=0; HUB_HOST=; HUB_TOKEN=; HUB_TRANSPORT=http
+ROLE=auto; COLOR=; REFRESH=10000; SHOW_OFFLINE=1; REALTIME=0
+TRAFFIC_INTERVAL=10; SESSION_GRACE=60; YIELD_SEC=1
+FAST_INTERVAL=12; FAST_TRAFFIC=2; WATCH_TTL=45; LIVE_MS=2000; AUTO_PAIR=1
+config_get ENABLED  main enabled 1
+config_get INTERVAL main interval 30
+config_get TRAFFIC_INTERVAL main traffic_interval 10
+config_get FAST_INTERVAL  main fast_interval 12
+config_get FAST_TRAFFIC   main fast_traffic_interval 2
+config_get WATCH_TTL      main watch_ttl 45
+config_get LIVE_MS        main live_ms 2000
+config_get SESSION_GRACE main session_grace 60
+config_get YIELD_SEC main yield_sec 1
+config_get MODE     main mode hub
+config_get AUTO_PAIR main auto_pair 1
+config_get KEY      main key "$KEY"
+config_get NODE_NAME main name ""
+config_get TOKEN    main token ""
+config_get TIMEOUT  main timeout 8
+config_get PUBLIC   main public_data 0
+config_get HUB_HOST main hub_host ""
+config_get HUB_TOKEN main hub_token "$TOKEN"
+config_get HUB_TRANSPORT main hub_transport http
+config_get ROLE     main role "auto"
+config_get COLOR    main color ""
+config_get REFRESH  main refresh_ms 10000
+config_get SHOW_OFFLINE main show_offline 1
+config_get REALTIME main realtime 0
+[ "$ENABLED" = "1" ] || [ "$ENABLED" = "on" ] || [ "$ENABLED" = "true" ] || exit 0
+[ -n "$ROLE" ] || ROLE=auto
+
+# ---- effective mode -------------------------------------------------------
+# mode=auto means "let opshare-peer decide". It publishes the result to
+# /tmp/opshare/mode, and a running daemon must follow it without a restart,
+# so this is re-evaluated on every tick - one read of a tmpfs file.
+EFF=$MODE
+set_eff_mode() {
+	if [ "$MODE" = "auto" ]; then
+		local m=
+		[ -r "$RUNDIR/mode" ] && IFS= read -r m < "$RUNDIR/mode" 2>/dev/null
+		case "$m" in hub|pull|off) EFF=$m ;; *) EFF=hub ;; esac
+	else
+		EFF=$MODE
+	fi
+}
+set_eff_mode
+
+# CPU class: 1 = a 880 MHz MIPS router that feels every fork, 2 = headroom.
+# opshare-peer writes it; fall back to a local guess if it never ran.
+POWER=2
+[ -r "$RUNDIR/power" ] && IFS= read -r POWER < "$RUNDIR/power" 2>/dev/null
+case "$POWER" in 1|2) ;; *) POWER=2 ;; esac
+if [ ! -r "$RUNDIR/power" ] && grep -qiE 'mt7621|mt7620|mt7628|qca953|ar9331|rt305' /proc/cpuinfo 2>/dev/null; then
+	POWER=1
+fi
+
+case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=30 ;; esac
+[ "$INTERVAL" -ge 12 ] || INTERVAL=30     # must exceed the sharded step (~6 s)
+case "$TRAFFIC_INTERVAL" in ''|*[!0-9]*) TRAFFIC_INTERVAL=10 ;; esac
+[ "$TRAFFIC_INTERVAL" -ge 1 ] || TRAFFIC_INTERVAL=10
+case "$FAST_INTERVAL" in ''|*[!0-9]*) FAST_INTERVAL=12 ;; esac
+[ "$FAST_INTERVAL" -ge 8 ] || FAST_INTERVAL=12    # a sharded step is ~5-6 s
+case "$FAST_TRAFFIC" in ''|*[!0-9]*) FAST_TRAFFIC=2 ;; esac
+[ "$FAST_TRAFFIC" -ge 1 ] || FAST_TRAFFIC=2
+case "$WATCH_TTL" in ''|*[!0-9]*) WATCH_TTL=45 ;; esac
+[ "$WATCH_TTL" -ge 10 ] || WATCH_TTL=45
+case "$LIVE_MS" in ''|*[!0-9]*) LIVE_MS=2000 ;; esac
+[ "$LIVE_MS" -ge 500 ] || LIVE_MS=2000
+case "$SESSION_GRACE" in ''|*[!0-9]*) SESSION_GRACE=60 ;; esac
+case "$YIELD_SEC" in ''|*[!0-9]*) YIELD_SEC=1 ;; esac
+[ "$YIELD_SEC" -ge 1 ] || YIELD_SEC=1
+[ "$YIELD_SEC" -le 5 ] || YIELD_SEC=5
+
+[ -n "$NODE_NAME" ] || NODE_NAME=$(uci -q get system.@system[0].hostname 2>/dev/null)
+[ -n "$NODE_NAME" ] || NODE_NAME=$(cat /proc/sys/kernel/hostname 2>/dev/null)
+[ -n "$NODE_NAME" ] || NODE_NAME=OpenWrt
+
+FORCE=${OP_SHARE_FORCE:-0}
+export OP_SHARE_FORCE="$FORCE"
+
+if has_cmd dbclient; then DB=1; else DB=0; fi
+if has_cmd curl; then HAS_CURL=1; else HAS_CURL=0; fi
+# Measured on the lab boxes for one 425-byte GET: busybox wget 42 ms,
+# curl 640 ms, uclient-fetch 800 ms. The process start-up dominates a request
+# this small, so the 2 s peer poll uses the cheapest client available.
+if has_cmd wget; then HAS_WGET=1; else HAS_WGET=0; fi
+if has_cmd uclient-fetch; then HAS_UF=1; else HAS_UF=0; fi
+SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=$TIMEOUT"
+
+ssh_run() { # host user port key command
+	local host=$1 user=$2 port=$3 key=$4 cmd=$5
+	if [ "$DB" = "1" ]; then
+		if [ -r "$key" ]; then dbclient -y -i "$key" -p "$port" "$user@$host" "$cmd" 2>/dev/null
+		else dbclient -y -p "$port" "$user@$host" "$cmd" 2>/dev/null; fi
+	else
+		if [ -r "$key" ]; then ssh $SSH_OPTS -i "$key" -p "$port" "$user@$host" "$cmd" 2>/dev/null
+		else ssh $SSH_OPTS -p "$port" "$user@$host" "$cmd" 2>/dev/null; fi
+	fi
+}
+
+ssh_push() { # host user port key  (stdin = merged json)
+	local host=$1 user=$2 port=$3 key=$4
+	if [ "$DB" = "1" ]; then
+		if [ -r "$key" ]; then dbclient -y -i "$key" -p "$port" "$user@$host" "/usr/bin/opshare-recv" >/dev/null 2>&1
+		else dbclient -y -p "$port" "$user@$host" "/usr/bin/opshare-recv" >/dev/null 2>&1; fi
+	else
+		if [ -r "$key" ]; then ssh $SSH_OPTS -i "$key" -p "$port" "$user@$host" "/usr/bin/opshare-recv" >/dev/null 2>&1
+		else ssh $SSH_OPTS -p "$port" "$user@$host" "/usr/bin/opshare-recv" >/dev/null 2>&1; fi
+	fi
+}
+
+http_url() { printf 'http://%s:%s/cgi-bin/opshare?t=%s&force=%s&a=%s' "$1" "$2" "$3" "$FORCE" "$4"; }
+
+# One GET, body on stdout. Cheapest available client wins: for a 425-byte
+# reply busybox wget costs 42 ms, curl 640 ms, uclient-fetch 800 ms - process
+# start-up dominates a request this small. This is also why a passive node
+# PULLS instead of being pushed to: a GET needs no curl, a POST does.
+http_cat() {
+	if [ "$HAS_WGET" = "1" ]; then
+		wget -q -T "$TIMEOUT" -O - "$1" 2>/dev/null
+	elif [ "$HAS_UF" = "1" ]; then
+		uclient-fetch -q -T "$TIMEOUT" -O - "$1" 2>/dev/null
+	elif [ "$HAS_CURL" = "1" ]; then
+		curl -fsS --max-time "$TIMEOUT" "$1" 2>/dev/null
+	else
+		return 1
+	fi
+}
+
+valid_json() {
+	[ -s "$1" ] || return 1
+	head -c 1 "$1" | grep -q '{' || return 1
+	grep -q '"schema"' "$1" || return 1
+	return 0
+}
+
+make_node() { # src section name host online fetched stale self role color basis cfg_section
+	local src=$1 sec=$2 nm=$3 host=$4 online=$5 fetched=$6 stale=$7 self=$8 role=$9 color=${10} basis=${11} csec=${12}
+	local meta
+	meta=$(printf '"_meta":{"name":"%s","host":"%s","online":%s,"fetched_at":%s,"stale":%s,"self":%s,"role":"%s","color":"%s","role_basis":"%s","section":"%s"},' \
+		"$(clean "$nm")" "$(clean "$host")" "$online" "$fetched" "$stale" "$self" \
+		"$(clean "$role")" "$(clean "$color")" "$(clean "$basis")" "$(clean "$csec")")
+	awk -v m="$meta" 'NR == 1 { sub(/^\{/, "{" m) } { print }' "$src" > "$NODES/$sec.json.$$"
+}
+
+# Pull the role (and the human-readable reason) from a node's own snapshot.
+json_str() {
+	grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$2" 2>/dev/null |
+		head -1 | sed 's/.*:[[:space:]]*"//; s/"$//'
+}
+
+# Peers maintain their own snapshot on their own (sharded) schedule. The hub
+# only READS that file - it must never trigger a full collection on the peer,
+# which used to be the single biggest CPU spike on the remote box.
+peer_get() { # transport host http_port token user ssh_port key -> stdout
+	if [ "$1" = "http" ]; then
+		http_cat "$(http_url "$2" "$3" "$4" self)"
+	else
+		ssh_run "$2" "$5" "$6" "$7" \
+			"if [ -s /tmp/opshare/self.json ]; then cat /tmp/opshare/self.json; else OP_SHARE_FORCE=1 /usr/bin/opshare-collect; fi"
+	fi
+}
+
+peer_put() { # transport host http_port token user ssh_port key  (stdin = all.json)
+	if [ "$1" = "http" ]; then
+		[ "$HAS_CURL" = "1" ] || return 1
+		curl -fsS --max-time "$TIMEOUT" -X POST --data-binary @- \
+			"$(http_url "$2" "$3" "$4" recv)" >/dev/null 2>&1
+	else
+		ssh_push "$2" "$5" "$6" "$7"
+	fi
+}
+
+# Pull the already-merged view from the first peer that answers. Used by
+# passive nodes (mode off/pull) - see the comment in sync_once.
+PULLED=0
+pull_cb() {
+	[ "$PULLED" = "1" ] && return 0
+	local sec=$1 pen phost phttp ptok raw
+	config_get pen "$sec" enabled 1
+	[ "$pen" = "1" ] || [ "$pen" = "on" ] || return 0
+	config_get phost "$sec" host
+	[ -n "$phost" ] || return 0
+	config_get phttp "$sec" http_port
+	case "$phttp" in ''|*[!0-9]*) phttp=80 ;; esac
+	config_get ptok "$sec" token
+	[ -n "$ptok" ] || ptok="$TOKEN"
+	raw="$RUNDIR/pull.$$"
+	http_cat "$(http_url "$phost" "$phttp" "$ptok" all)" > "$raw" 2>/dev/null
+	if valid_json "$raw"; then
+		mv "$raw" "$ALL"
+		date +%s > "$RUNDIR/pull.ts" 2>/dev/null
+		PULLED=1
+	else
+		rm -f "$raw"
+	fi
+	return 0
+}
+pull_merged() {
+	PULLED=0
+	config_foreach pull_cb peer
+	[ "$PULLED" = "1" ]
+}
+
+count_auto() { # numberOf peers that were paired automatically
+	config_get a "$1" auto 0
+	case "$a" in 1|on) AUTOP=$((AUTOP + 1)) ;; esac
+}
+
+alias_cb() { # collect user-defined device names into the shared view
+	config_get amac "$1" mac
+	config_get aname "$1" name
+	config_get anote "$1" note
+	[ -n "$amac" ] && [ -n "$aname" ] || return 0
+	printf '{"mac":"%s","name":"%s","note":"%s"},' \
+		"$(clean "$(lower_mac "$amac")")" "$(clean "$aname")" "$(clean "$anote")" >> "$ALIASES"
+}
+lower_mac() { printf '%s' "$1" | tr 'A-Z' 'a-z'; }
+
+# A plain (non-OpenWrt) router / switch cannot run the collector. Let the
+# user declare it anyway so the topology can show it as an unmanaged node
+# instead of silently pretending it does not exist.
+external_cb() {
+	local sec=$1 nm up note cnt
+	config_get nm "$sec" name
+	config_get up "$sec" uplink
+	config_get note "$sec" note
+	config_get cnt "$sec" clients
+	[ -n "$nm" ] || nm="$sec"
+	case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
+	printf '{"id":"%s","name":"%s","uplink":"%s","note":"%s","clients":%s},' \
+		"$(clean "$sec")" "$(clean "$nm")" "$(clean "$up")" \
+		"$(clean "$note")" "$cnt" >> "$EXTERNALS"
+}
+
+sync_once() {
+	local now raw sec penabled phost puser pport ptrans pkey ptoken pname ppush phttp
+	local SELF_ROLE SELF_BASIS
+	# Per-process scratch files: a manual refresh may overlap the background
+	# loop. Private names + atomic mv mean no lock, no deadlock, no duplicate
+	# nodes (previously both appended to the same nodes.list).
+	LIST="$RUNDIR/nodes.list.$$"
+	ALIASES="$RUNDIR/aliases.part.$$"
+	EXTERNALS="$RUNDIR/externals.part.$$"
+	ALLTMP="$ALL.$$"
+	# Reload UCI each cycle so a role / peer change made from the web UI takes
+	# effect on the next cycle without restarting the service.
+	config_load opshare 2>/dev/null
+	config_get MODE main mode hub
+	config_get AUTO_PAIR main auto_pair 1
+	set_eff_mode
+	now=$(date +%s)
+	: > "$LIST"
+	: > "$ALIASES"
+	: > "$EXTERNALS"
+
+	# Passive node: pull the merged view instead of waiting to be pushed to.
+	# A downstream box can always reach its own gateway, so one-directional
+	# NAT is not a limitation here - and pulling costs a plain GET, which every
+	# image can do (a POST needs curl, which small builds often skip).
+	if [ "$EFF" = "off" ] || [ "$EFF" = "pull" ]; then
+		if pull_merged; then
+			[ "$PUBLIC" = "1" ] && cp "$ALL" /www/opshare/all.json 2>/dev/null
+			return 0
+		fi
+		[ -s "$ALL" ] && return 0    # no peer reachable: keep the last good copy
+	fi
+
+	if [ "$MODE" = "pull" ]; then
+		[ -n "$HUB_HOST" ] || { log "pull mode without hub_host"; return 1; }
+		raw="$RUNDIR/pull.$$"
+		if [ "$HUB_TRANSPORT" = "http" ] && [ "$HAS_CURL" = "1" ]; then
+			curl -fsS --max-time "$TIMEOUT" "$(http_url "$HUB_HOST" 80 "$HUB_TOKEN" all)" > "$raw" 2>/dev/null
+		else
+			ssh_run "$HUB_HOST" root 22 "$KEY" "cat /tmp/opshare/all.json" > "$raw" 2>/dev/null
+		fi
+		if valid_json "$raw"; then mv "$raw" "$ALL"; else rm -f "$raw"; fi
+		[ "$PUBLIC" = "1" ] && cp "$ALL" /www/opshare/all.json 2>/dev/null
+		return 0
+	fi
+
+	# ---- local node: the loop already produced a fresh sharded snapshot ----
+	[ -s "$RUNDIR/self.json" ] || /usr/bin/opshare-collect > /dev/null 2>&1
+	if valid_json "$RUNDIR/self.json"; then
+		SELF_ROLE=$(json_str role "$RUNDIR/self.json")
+		[ -n "$SELF_ROLE" ] || SELF_ROLE=node
+		SELF_BASIS=$(json_str role_basis "$RUNDIR/self.json")
+		[ -n "$SELF_BASIS" ] || SELF_BASIS="可在页面自由设置角色"
+		make_node "$RUNDIR/self.json" self "$NODE_NAME" local 1 "$now" 0 1 \
+			"$SELF_ROLE" "$COLOR" "$SELF_BASIS" main
+		echo "$NODES/self.json.$$" >> "$LIST"
+	else
+		log "local snapshot missing"
+	fi
+
+	# ---- remote nodes ----
+	config_foreach sync_peer peer
+
+	# ---- user aliases + manually declared unmanaged devices ----
+	ALIAS_JSON=$(cat "$ALIASES" 2>/dev/null | sed 's/,$//')
+	config_foreach external_cb external
+	EXTERNAL_JSON=$(cat "$EXTERNALS" 2>/dev/null | sed 's/,$//')
+
+	# ---- topology hint ----
+	servers=0
+	while read -r f; do
+		[ -r "$f" ] || continue
+		grep -q '"dhcp"[[:space:]]*:[[:space:]]*"server"' "$f" && servers=$((servers + 1))
+	done < "$LIST"
+	[ "$servers" -ge 2 ] && TOPO="双 DHCP / 串联" || { [ "$servers" -eq 1 ] && TOPO="单 DHCP + AP/桥接" || TOPO="纯桥接"; }
+
+	# ---- pairing state (shown in the page header) ----
+	AUTOP=0
+	config_foreach count_auto peer
+
+	# ---- merge ----
+	{
+		printf '{"schema":2,"updated":%s,"ui":{"refresh_ms":%s,"show_offline":%s,"realtime":%s,"interval":%s,"traffic_interval":%s,"session_grace":%s,"yield_sec":%s,"live_ms":%s,"fast_traffic":%s,"fast_interval":%s,"live":%s,"power":%s,"auto_pair":%s,"auto_peers":%s,"eff_mode":"%s"},"aliases":[%s],"meta":{"topology":"%s","master":"%s","server_count":%s,"role_rule":"%s","externals":[%s]},"nodes":[' \
+			"$now" "$REFRESH" "$SHOW_OFFLINE" "$REALTIME" "$INTERVAL" "$TRAFFIC_INTERVAL" "$SESSION_GRACE" "$YIELD_SEC" "$LIVE_MS" "$FAST_TRAFFIC" "$FAST_INTERVAL" "$([ -s "$RUNDIR/live.json" ] && echo 1 || echo 0)" "$POWER" "$AUTO_PAIR" "$AUTOP" "$(clean "$EFF")" "$ALIAS_JSON" \
+			"$(clean "$TOPO")" "$(clean "$NODE_NAME")" "$servers" \
+			"$(clean '角色是完全自由的标签，拓扑不决定主从：未设置时显示中性「节点」，自动判定只给建议；可在页面下拉或 UCI option role 自由设置')" \
+			"$EXTERNAL_JSON"
+		local first=1 f
+		while read -r f; do
+			[ -r "$f" ] || continue
+			[ "$first" = "1" ] || printf ','
+			cat "$f"
+			first=0
+		done < "$LIST"
+		printf ']}'
+	} > "$ALLTMP"
+	if valid_json "$ALLTMP"; then
+		mv "$ALLTMP" "$ALL"
+		if [ "$PUBLIC" = "1" ] && [ -d /www/opshare ]; then
+			cp "$ALL" "/www/opshare/all.json.$$" && mv "/www/opshare/all.json.$$" /www/opshare/all.json
+		fi
+	else
+		rm -f "$ALLTMP"; log "merged snapshot invalid"; return 1
+	fi
+	rm -f "$LIST" "$ALIASES" "$EXTERNALS" "$NODES"/*.$$ 2>/dev/null
+
+	return 0
+}
+
+# Pushing is deliberately a separate step so one cycle never has two SSH
+# handshakes plus a merge packed into the same second.
+push_all() {
+	[ "$EFF" = "hub" ] || return 0
+	[ -s "$ALL" ] || return 0
+	config_foreach push_peer peer < "$ALL"
+}
+
+sync_peer() {
+	sec="$1"
+	config_get penabled "$sec" enabled 1
+	[ "$penabled" = "1" ] || [ "$penabled" = "on" ] || return 0
+	config_get phost "$sec" host; [ -n "$phost" ] || return 0
+	config_get puser "$sec" user; [ -n "$puser" ] || puser=root
+	config_get pport "$sec" port; [ -n "$pport" ] || pport=22
+	config_get ptrans "$sec" transport; [ -n "$ptrans" ] || ptrans=ssh
+	config_get pkey "$sec" key; [ -n "$pkey" ] || pkey="$KEY"
+	config_get ptoken "$sec" token; [ -n "$ptoken" ] || ptoken="$TOKEN"
+	config_get pname "$sec" name; [ -n "$pname" ] || pname="$phost"
+	config_get prole "$sec" role; [ -n "$prole" ] || prole=auto
+	config_get pcolor "$sec" color; [ -n "$pcolor" ] || pcolor=
+	config_get phttp "$sec" http_port; [ -n "$phttp" ] || phttp=80
+
+	local raw="$CACHE/$sec.$$" cached="$CACHE/$sec.json" tsfile="$CACHE/$sec.ts"
+	local online=1 fetched stale=0
+	# A fast merge runs every few seconds while somebody is watching the page.
+	# It must never touch the network: reuse the cached snapshot and only
+	# recompute how old it is. The real fetch keeps its own (slower) cadence.
+	if [ "${FAST_MERGE:-0}" = "1" ] && [ -r "$cached" ]; then
+		fetched=0
+		[ -r "$tsfile" ] && IFS= read -r fetched < "$tsfile" 2>/dev/null
+		case "$fetched" in ''|*[!0-9]*) fetched=0 ;; esac
+		[ "$fetched" -gt 0 ] && stale=$(( $(date +%s) - fetched )) || stale=0
+		[ "$stale" -ge 0 ] || stale=0
+	else
+	peer_get "$ptrans" "$phost" "$phttp" "$ptoken" "$puser" "$pport" "$pkey" > "$raw" 2>/dev/null
+	if valid_json "$raw"; then
+		mv "$raw" "$cached"; fetched=$(date +%s); echo "$fetched" > "$tsfile"
+	else
+		rm -f "$raw"
+		[ -r "$cached" ] || { log "peer $sec unreachable and no cache"; return 0; }
+		online=0; fetched=$(cat "$tsfile" 2>/dev/null); [ -n "$fetched" ] || fetched=0
+		stale=$(( $(date +%s) - fetched ))
+	fi
+	fi
+	# no hardcoded node names: fall back to the peer's own hostname
+	if [ -z "$pname" ] || [ "$pname" = "$phost" ]; then
+		hn=$(json_str hostname "$cached")
+		[ -n "$hn" ] && pname="$hn"
+	fi
+	# role is a free label: honour an explicit override in the peer section,
+	# otherwise use whatever the peer itself chose (auto-detection only hints).
+	if [ -z "$prole" ] || [ "$prole" = "auto" ]; then
+		prole=$(json_str role "$cached"); [ -n "$prole" ] || prole=node
+		pbasis=$(json_str role_basis "$cached")
+		[ -n "$pbasis" ] || pbasis="对端节点自由设置（自动建议仅作参考）"
+	else
+		pbasis="本节点 peer 段强制指定：$prole"
+	fi
+	make_node "$cached" "$sec" "$pname" "$phost" "$online" "$fetched" "$stale" 0 \
+		"$prole" "$pcolor" "$pbasis" "$sec"
+	echo "$NODES/$sec.json.$$" >> "$LIST"
+}
+
+push_peer() {
+	sec="$1"
+	config_get penabled "$sec" enabled 1
+	[ "$penabled" = "1" ] || [ "$penabled" = "on" ] || return 0
+	config_get ppush "$sec" push 1
+	[ "$ppush" = "1" ] || [ "$ppush" = "on" ] || return 0
+	config_get phost "$sec" host; [ -n "$phost" ] || return 0
+	config_get puser "$sec" user; [ -n "$puser" ] || puser=root
+	config_get pport "$sec" port; [ -n "$pport" ] || pport=22
+	config_get ptrans "$sec" transport; [ -n "$ptrans" ] || ptrans=ssh
+	config_get pkey "$sec" key; [ -n "$pkey" ] || pkey="$KEY"
+	config_get ptoken "$sec" token; [ -n "$ptoken" ] || ptoken="$TOKEN"
+	config_get phttp "$sec" http_port; [ -n "$phttp" ] || phttp=80
+	peer_put "$ptrans" "$phost" "$phttp" "$ptoken" "$puser" "$pport" "$pkey" || log "push to $sec failed"
+}
+
+# ---------------------------------------------------------------------------
+# Cadence (v8)
+#
+# One big cycle is split into four independent clocks, because their costs are
+# not comparable at all:
+#
+#   counters  ~10 ms    opshare-traffic: one awk over /proc/net/dev. This is
+#                       what makes 1-2 s numbers affordable. Always local.
+#   full      ~0.5 s    opshare-collect --step, sharded. Backgrounded, so the
+#                       counter ticker keeps running while it works.
+#   merge     ~50 ms    concatenate the cached snapshots. Cheap, so it follows
+#                       the full collection - but peers are only re-fetched
+#                       every `interval`, because an SSH handshake costs more
+#                       than everything else combined.
+#   push      ~0.3 s    one send per peer, strictly at `interval`.
+#
+# While the page is open (any request refreshes /tmp/opshare/want) the first
+# three switch to the fast profile; `watch_ttl` seconds after the last request
+# everything drops back to the quiet profile. Precision is only paid for while
+# somebody is actually looking at it.
+# ---------------------------------------------------------------------------
+WANT="$RUNDIR/want"
+LIVE="$RUNDIR/live"
+mkdir -p "$LIVE" 2>/dev/null
+
+# Remote counters ride HTTP even when the *bulk* transport is SSH: a tiny GET
+# costs ~15 ms, an SSH handshake several hundred. A failure backs the peer off
+# for five minutes so an unreachable web port never costs a request every tick.
+fast_peer() {
+	local sec=$1 pen phost phttp ptok out ft
+	config_get pen "$sec" enabled 1
+	[ "$pen" = "1" ] || [ "$pen" = "on" ] || return 0
+	config_get phost "$sec" host; [ -n "$phost" ] || return 0
+	config_get phttp "$sec" http_port 80
+	config_get ptok "$sec" token; [ -n "$ptok" ] || ptok="$TOKEN"
+	[ -n "$ptok" ] || return 0                  # peers reject unknown tokens
+	[ "$HAS_WGET" = "1" ] || [ "$HAS_UF" = "1" ] || [ "$HAS_CURL" = "1" ] || return 0
+	if [ -r "$LIVE/$sec.fail" ]; then
+		ft=0
+		IFS= read -r ft < "$LIVE/$sec.fail" 2>/dev/null
+		case "$ft" in ''|*[!0-9]*) ft=0 ;; esac
+		[ "$ft" -gt 0 ] && [ $(( $(date +%s) - ft )) -lt 300 ] && return 0
+	fi
+	out="$LIVE/$sec.snap"
+	if [ "$HAS_WGET" = "1" ]; then
+		wget -q -T 4 -O "$out.tmp" \
+			"$(http_url "$phost" "$phttp" "$ptok" traffic)" 2>/dev/null
+	elif [ "$HAS_UF" = "1" ]; then
+		uclient-fetch -q -T 4 -O "$out.tmp" \
+			"$(http_url "$phost" "$phttp" "$ptok" traffic)" 2>/dev/null
+	else
+		curl -fsS --max-time 4 "$(http_url "$phost" "$phttp" "$ptok" traffic)" \
+			> "$out.tmp" 2>/dev/null
+	fi || {
+		rm -f "$out.tmp"
+		date +%s > "$LIVE/$sec.fail" 2>/dev/null
+		log "peer $sec has no fast counter channel, backing off 5 min"
+		return 0
+	}
+	[ -s "$out.tmp" ] || { rm -f "$out.tmp"; return 0; }
+	if mv "$out.tmp" "$out" 2>/dev/null; then
+		rm -f "$LIVE/$sec.fail"
+		date +%s > "$LIVE/$sec.ts" 2>/dev/null
+	fi
+	return 0
+}
+
+build_live() { # now watching ti ci
+	OP_NOW="$1" OP_WATCH="$2" OP_CAD_T="$3" OP_CAD_F="$4" OP_LIVE="$LIVE_MS" \
+		/usr/bin/opshare-live >/dev/null 2>&1
+}
+
+loop() {
+	local now w ti ci wt colpid= need_merge=0 push_at=0
+	local last_traf=0 last_full=0 last_fetch=0 last_push=0 last_live=0 last_peer=0 pidle=0
+	printf '%s' "$TOKEN" > "$RUNDIR/token" 2>/dev/null
+	: > "$WANT"
+	build_live "$(date +%s)" 0 "$TRAFFIC_INTERVAL" "$INTERVAL"
+	# Discover and pair once at start-up (backgrounded: the first hello may
+	# take a couple of seconds on a slow box and must not delay the page).
+	[ "$AUTO_PAIR" = "1" ] && /usr/bin/opshare-peer -q &
+	while :; do
+		now=$(date +%s)
+		set_eff_mode
+
+		# --- is anybody looking at the data right now? ----------------------
+		w=0
+		if [ -r "$WANT" ]; then
+			wt=0
+			IFS= read -r wt < "$WANT" 2>/dev/null
+			case "$wt" in ''|*[!0-9]*) wt=0 ;; esac
+			[ "$wt" -gt 0 ] && [ $((now - wt)) -lt "$WATCH_TTL" ] && w=1
+		fi
+		ti=$TRAFFIC_INTERVAL; ci=$INTERVAL
+		if [ "$w" = "1" ]; then ti=$FAST_TRAFFIC; ci=$FAST_INTERVAL; fi
+		# A full collection costs ~0.5 s on the lab box and several seconds on
+		# an 880 MHz MIPS: at 12 s that alone would eat a fifth of the CPU, so
+		# the low-power profile keeps 20 s even while somebody is watching, and
+		# 45 s when nobody is.
+		if [ "$POWER" = "1" ] && [ "$ci" -lt 20 ]; then ci=20; fi
+		if [ "$POWER" = "1" ] && [ "$w" = "0" ] && [ "$ci" -lt 45 ]; then ci=45; fi
+
+		# --- 1. counters: the only job that must be fast --------------------
+		# On the low-power profile an idle box does not sample at all: the page
+		# (and any peer asking for a=traffic) triggers a sample on demand, so
+		# there is nothing to gain from a timer nobody reads.
+		if [ "$w" = "1" ] || [ "$POWER" = "2" ]; then
+			if [ $((now - last_traf)) -ge "$ti" ]; then
+				OP_TRAFFIC=1 OP_NOW="$now" /usr/bin/opshare-traffic
+				last_traf=$now
+				# remote counters at half the local rate, only while watched
+				if [ "$w" = "1" ] && [ "$EFF" = "hub" ] &&
+					[ $((now - last_fetch)) -ge $((ti * 2)) ]; then
+					config_foreach fast_peer peer
+				fi
+			fi
+		fi
+
+		# --- 2. full collection: backgrounded, can never block the ticker ---
+		if [ -n "$colpid" ]; then
+			if ! kill -0 "$colpid" 2>/dev/null; then
+				wait "$colpid" 2>/dev/null
+				colpid=
+				need_merge=1
+			fi
+		elif [ $((now - last_full)) -ge "$ci" ]; then
+			/usr/bin/opshare-collect --step >/dev/null 2>&1 &
+			colpid=$!
+			last_full=$now
+		fi
+
+		# --- 3. merge: cheap, follows the collection ------------------------
+		if [ "$need_merge" = "1" ]; then
+			need_merge=0
+			case "$EFF" in
+				hub|pull)
+					if [ $((now - last_fetch)) -ge "$INTERVAL" ]; then
+						sync_once || log "sync cycle failed"
+						last_fetch=$now
+					else
+						# reuse the peer cache, never touch the network
+						FAST_MERGE=1 sync_once || log "fast merge failed"
+					fi
+					;;
+				*) [ -s "$ALL" ] || sync_once ;;
+			esac
+			[ "$EFF" = "hub" ] && push_at=$((now + 3))
+		fi
+
+		# --- 4. push: one round of SSH per `interval`, never per merge ------
+		if [ "$push_at" -gt 0 ] && [ "$now" -ge "$push_at" ]; then
+			if [ $((now - last_push)) -ge "$INTERVAL" ]; then
+				push_all
+				last_push=$now
+			fi
+			push_at=0
+		fi
+
+		# --- 5. the tiny live payload the page polls ------------------------
+		if [ $((now - last_live)) -ge "$ti" ]; then
+			build_live "$now" "$w" "$ti" "$ci"
+			last_live=$now
+		fi
+
+		# --- 6. zero-config discovery: one probe round every two minutes ----
+		if [ "$AUTO_PAIR" = "1" ] && [ $((now - last_peer)) -ge 120 ]; then
+			/usr/bin/opshare-peer -q >/dev/null 2>&1 &
+			last_peer=$now
+		fi
+
+		# A wake-up is a fork (`date`), which a 880 MHz MIPS router does feel.
+		# Idle ticks are therefore much longer on the low-power profile, where
+		# nothing is sampled anyway.
+		if [ "$w" = "1" ]; then
+			sleep 1
+		elif [ "$POWER" = "1" ]; then
+			sleep 12
+		else
+			sleep 3
+		fi
+	done
+}
+
+case "${1:-}" in
+	--loop) loop ;;
+	--push) push_all ;;
+	--live) build_live "$(date +%s)" 1 "$TRAFFIC_INTERVAL" "$INTERVAL" ;;
+	*)      sync_once; push_all ;;
+esac

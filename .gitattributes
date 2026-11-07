@@ -1,0 +1,16 @@
+# Normalise everything to LF in the repository *and* on checkout.
+#
+# This is not hygiene, it is a bug fix. A shell script whose first line is
+# "#!/bin/sh\r" fails with "/usr/bin/opshare-sync: not found" - the kernel
+# looks for an interpreter literally named "sh\r" - and procd then restarts it
+# forever. That happens whenever the tree is edited on Windows without this
+# file, so the CRLF->LF conversion is pinned here as well as at pack time
+# (build-ipk.py normalises again, so a bad checkout still cannot ship breakage).
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.ipk binary

@@ -1,0 +1,31 @@
+{
+	"admin/status/opshare": {
+		"title": "设备总览",
+		"order": 65,
+		"action": {
+			"type": "view",
+			"path": "opshare/index"
+		}
+	},
+	"admin/status/opshare/data": {
+		"action": {
+			"type": "function",
+			"module": "luci.controller.opshare",
+			"function": "action_data"
+		}
+	},
+	"admin/status/opshare/live": {
+		"action": {
+			"type": "function",
+			"module": "luci.controller.opshare",
+			"function": "action_live"
+		}
+	},
+	"admin/status/opshare/setrole": {
+		"action": {
+			"type": "function",
+			"module": "luci.controller.opshare",
+			"function": "action_setrole"
+		}
+	}
+}

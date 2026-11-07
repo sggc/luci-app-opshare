@@ -1,0 +1,330 @@
+#!/bin/sh
+# opshare-peer - zero-config discovery and pairing.
+#
+# Goal: install the package on two boxes, change nothing, and have them share
+# data. No IP to type in, no SSH key to copy, no mode to pick.
+#
+# How it works
+#   1. every box keeps an identity (/etc/opshare/identity) and a shared secret
+#      (opshare.main.token), both generated once from /dev/urandom;
+#   2. candidates are the default gateway and the three newest DHCP leases -
+#      exactly the two directions a cascaded / dual-NAT home network has;
+#   3. each candidate is asked `GET /cgi-bin/opshare?a=hello`, which returns
+#      its id, hostname, token and CPU class without requiring any secret;
+#   4. a peer section is written to UCI (transport http, so no SSH key ever
+#      has to be authorised on the other side);
+#   5. who aggregates is decided symmetrically from (cpu class, id), so both
+#      boxes reach the same answer without talking to each other again.
+#
+# a=hello only answers private sources and is gated by `option auto_pair`.
+#
+# usage: opshare-peer [-q] [-f]     -q quiet, -f force (ignore the 60s guard)
+PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+export PATH
+
+RUNDIR=/tmp/opshare
+IDENT=/etc/opshare/identity
+FOUND="$RUNDIR/peers.found"
+STAMP="$RUNDIR/peer.stamp"
+mkdir -p "$RUNDIR" /etc/opshare 2>/dev/null
+
+QUIET=0; FORCE=0
+for a in "$@"; do
+	case "$a" in
+		-q) QUIET=1 ;;
+		-f) FORCE=1 ;;
+	esac
+done
+say() { [ "$QUIET" = "1" ] || printf '%s\n' "$*"; }
+log() { logger -t opshare "$*" 2>/dev/null || :; }
+
+# One run at a time. The daemon calls this every two minutes and a manual run
+# must not interleave with it: both would write the same UCI sections, and the
+# found-list would end up with duplicate lines that skew the role decision.
+if [ "$FORCE" != "1" ]; then
+	got=0
+	if mkdir "$RUNDIR/lock" 2>/dev/null; then
+		got=1
+	else
+		lp=$(cat "$RUNDIR/lock/pid" 2>/dev/null)
+		if [ -z "$lp" ] || [ ! -d "/proc/$lp" ]; then
+			rm -rf "$RUNDIR/lock"          # a crashed run must not block us
+			mkdir "$RUNDIR/lock" 2>/dev/null && got=1
+		fi
+	fi
+	[ "$got" = "1" ] || exit 0
+	printf '%s' "$$" > "$RUNDIR/lock/pid" 2>/dev/null
+	trap 'rm -rf "$RUNDIR/lock"' EXIT INT TERM
+fi
+
+# ---------------------------------------------------------------- identity --
+[ -r "$IDENT" ] && . "$IDENT"
+if [ -z "$MYID" ]; then
+	MYID=$(head -c 16 /dev/urandom | md5sum 2>/dev/null | cut -c1-12)
+	case "$MYID" in ''|*[!0-9a-f]*) MYID=p$(date +%s)$$ ;; esac
+fi
+[ -n "$MYNAME" ] || MYNAME=$(cat /proc/sys/kernel/hostname 2>/dev/null)
+[ -n "$MYNAME" ] || MYNAME=OpenWrt
+
+AUTO=$(uci -q get opshare.main.auto_pair 2>/dev/null)
+[ -n "$AUTO" ] || AUTO=1
+PORT=$(uci -q get opshare.main.http_port 2>/dev/null)
+case "$PORT" in ''|*[!0-9]*) PORT=80 ;; esac
+TIMEOUT=$(uci -q get opshare.main.pair_timeout 2>/dev/null)
+case "$TIMEOUT" in ''|*[!0-9]*) TIMEOUT=3 ;; esac
+
+# A shared secret is mandatory: an empty token disables the check in the CGI.
+TOK=$(uci -q get opshare.main.token 2>/dev/null)
+if [ -z "$TOK" ]; then
+	TOK=$(head -c 16 /dev/urandom | md5sum 2>/dev/null | cut -c1-16)
+	case "$TOK" in ''|*[!0-9a-f]*) TOK=tk$(date +%s)$$ ;; esac
+	uci -q set opshare.main.token="$TOK" && uci -q commit opshare
+	say "生成共享密钥 $TOK"
+fi
+printf '%s' "$TOK" > "$RUNDIR/token" 2>/dev/null
+
+# CPU class drives two things: who aggregates, and how aggressive the timers
+# are. 2 = plenty of headroom, 1 = a 880 MHz MIPS router that feels every fork.
+POWER=$(uci -q get opshare.main.power_profile 2>/dev/null)
+case "$POWER" in
+	low) POWER=1 ;;
+	normal) POWER=2 ;;
+	*)
+		POWER=2
+		if grep -qiE 'mt7621|mt7620|mt7628|mt7530|qca953|ar9331|rt305' \
+			/proc/cpuinfo 2>/dev/null; then
+			POWER=1
+		fi
+		;;
+esac
+printf '%s' "$MYID" > "$RUNDIR/id" 2>/dev/null
+printf '%s' "$POWER" > "$RUNDIR/power" 2>/dev/null
+printf '%s' "$AUTO" > "$RUNDIR/autopair" 2>/dev/null
+printf 'MYID=%s\nMYNAME=%s\n' "$MYID" "$MYNAME" > "$IDENT"
+
+# --------------------------------------------------------------- http glue --
+HAS_WGET=0; HAS_UF=0; HAS_CURL=0
+command -v wget >/dev/null 2>&1 && HAS_WGET=1
+command -v uclient-fetch >/dev/null 2>&1 && HAS_UF=1
+command -v curl >/dev/null 2>&1 && HAS_CURL=1
+
+http_get() { # url -> body on stdout, non-zero on failure
+	if [ "$HAS_WGET" = "1" ]; then
+		wget -q -T "$TIMEOUT" -O - "$1" 2>/dev/null
+	elif [ "$HAS_UF" = "1" ]; then
+		uclient-fetch -q -T "$TIMEOUT" -O - "$1" 2>/dev/null
+	elif [ "$HAS_CURL" = "1" ]; then
+		curl -fsS --max-time "$TIMEOUT" "$1" 2>/dev/null
+	else
+		return 1
+	fi
+}
+
+jstr() { # json key
+	printf '%s' "$1" | grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" 2>/dev/null |
+		head -1 | sed 's/^[^:]*:[[:space:]]*"//; s/"$//'
+}
+jnum() { # json key
+	printf '%s' "$1" | grep -o "\"$2\"[[:space:]]*:[[:space:]]*[0-9]*" 2>/dev/null |
+		head -1 | sed 's/^[^:]*:[[:space:]]*//'
+}
+
+is_priv() {
+	case "$1" in
+		10.*|192.168.*|127.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|169.254.*) return 0 ;;
+	esac
+	return 1
+}
+
+# ------------------------------------------------------------- candidates ---
+# Only two directions exist in a home cascade:
+#   up   -> the default gateway is the box in front of us (dual NAT / bridge)
+#   down -> the newest DHCP leases are the boxes behind us
+# Anything else would mean scanning the whole subnet, which costs far more
+# than it is worth on a 24/7 router.
+CANDS="$RUNDIR/cands.$$"
+: > "$CANDS"
+
+GW=$(ip route 2>/dev/null | awk '$1 == "default" { print $3; exit }')
+[ -n "$GW" ] && is_priv "$GW" && echo "$GW" >> "$CANDS"
+
+if [ -r /tmp/dhcp.leases ]; then
+	awk '{ a[NR] = $3 } END { for (i = NR; i > 0; i--) print a[i] }' /tmp/dhcp.leases 2>/dev/null |
+		head -6 >> "$CANDS"
+fi
+
+# up, second chance: anyone who has spoken to us. Behind a second NAT we cannot
+# reach the downstream box's LAN address, but its WAN address is the source of
+# the handshake it sent us, so this list is the only way that direction is ever
+# discovered. Consumed and trimmed here so the file cannot grow forever.
+if [ -r "$RUNDIR/seen" ]; then
+	awk '{ print $2 }' "$RUNDIR/seen" 2>/dev/null | sort -u | tail -8 >> "$CANDS"
+	awk '{ print $1, $2 }' "$RUNDIR/seen" 2>/dev/null | tail -8 > "$RUNDIR/seen.new"
+	mv "$RUNDIR/seen.new" "$RUNDIR/seen" 2>/dev/null
+fi
+# never hello ourselves, and never hello an address twice
+MYADDRS=$(ip -4 addr show 2>/dev/null | awk '/inet / { sub(/\/.*/, "", $2); print $2 }')
+: > "$CANDS.dedup"
+while read -r ip; do
+	case "$ip" in ''|*[!0-9.]*) continue ;; esac
+	printf '%s\n' "$MYADDRS" | grep -qx "$ip" && continue
+	grep -qx "$ip" "$CANDS.dedup" 2>/dev/null && continue
+	echo "$ip" >> "$CANDS.dedup"
+done < "$CANDS"
+mv "$CANDS.dedup" "$CANDS" 2>/dev/null
+
+if [ ! -s "$CANDS" ]; then
+	say "没有可探测的邻居（无默认网关也无 DHCP 租约）"
+	rm -f "$CANDS"
+	[ "$FORCE" = "1" ] && exit 0
+	exit 0
+fi
+
+# Peers already paired stay in the running even if hello is slow today: the
+# aggregator decision below must not flip just because one probe timed out.
+: > "$FOUND"
+
+# Peers configured by hand before this feature existed must not be paired
+# again: the same box would be fetched twice and appear as two nodes.
+MANUALMAP="$RUNDIR/manual.map"
+uci -q show opshare 2>/dev/null |
+	sed -n "s/^opshare\.\([^.=]*\)\.host=['\"]*\([^'\"]*\)['\"]*$/\1 \2/p" \
+	> "$MANUALMAP" 2>/dev/null
+
+NONCE=$(head -c 8 /dev/urandom | md5sum 2>/dev/null | cut -c1-8)
+CHANGED=0; PAIRED=0
+
+# Probe everything at once under a hard budget. A home LAN is full of phones and
+# IoT plugs whose port 80 silently drops the SYN instead of refusing it, and
+# busybox wget's -T covers reads, not connect(); probing serially there stalls
+# for minutes per unresponsive address. Four seconds total, then everything is
+# killed - a real peer answers in under a second.
+HITS="$RUNDIR/hits.$$"
+: > "$HITS"
+GPIDS=
+for ip in $(cat "$CANDS" 2>/dev/null); do
+	(
+		b=$(http_get "http://$ip:$PORT/cgi-bin/opshare?a=hello&id=$MYID&pw=$POWER&n=$NONCE")
+		[ -n "$b" ] && printf '%s\t%s\n' "$ip" "$b" >> "$HITS"
+	) </dev/null >/dev/null 2>&1 &
+	GPIDS="$GPIDS $!"
+done
+if [ -n "$GPIDS" ]; then
+	( sleep "$TIMEOUT"; kill $GPIDS 2>/dev/null ) >/dev/null 2>&1 &
+	sleep $((TIMEOUT + 1))
+	kill -9 $GPIDS 2>/dev/null
+fi
+
+while IFS='	' read -r ip resp; do
+	[ -n "$ip" ] || continue
+	if [ "$AUTO" = "0" ]; then
+		# Manual mode: just report who is out there, never write config.
+		rid=$(jstr "$resp" id)
+		[ -n "$rid" ] && say "发现 $ip · $(jstr "$resp" name)（未配对，auto_pair=0）"
+		continue
+	fi
+	[ -n "$resp" ] || continue
+	[ "$(jnum "$resp" ok)" = "1" ] || {
+		say "$ip 拒绝配对：$(jstr "$resp" reason)"
+		continue
+	}
+	rid=$(jstr "$resp" id)
+	[ -n "$rid" ] || continue
+	[ "$rid" = "$MYID" ] && continue
+	rtok=$(jstr "$resp" token)
+	rname=$(jstr "$resp" name)
+	rpw=$(jnum "$resp" pw); case "$rpw" in ''|*[!0-9]*) rpw=2 ;; esac
+
+	RID8=$(printf '%s' "$rid" | cut -c1-8)
+	MANUAL=
+	while read -r msec mhost; do
+		[ -n "$mhost" ] || continue
+		[ "$mhost" = "$ip" ] && [ "$msec" != "auto_$RID8" ] && MANUAL=$msec
+	done < "$MANUALMAP"
+	if [ -n "$MANUAL" ]; then
+		say "$rname（$ip）已由手工配置 opshare.$MANUAL 覆盖，跳过自动配对"
+		echo "$rid $rpw $ip $rname" >> "$FOUND"
+		PAIRED=$((PAIRED + 1))
+		continue
+	fi
+
+	sec="auto_$RID8"
+	old_host=$(uci -q get "opshare.$sec.host")
+	old_tok=$(uci -q get "opshare.$sec.token")
+	if [ "$old_host" = "$ip" ] && [ "$old_tok" = "$rtok" ]; then
+		say "已配对 $rname（$ip）"
+	else
+		uci -q delete "opshare.$sec"
+		uci -q set "opshare.$sec=peer"
+		uci -q set "opshare.$sec.enabled=1"
+		uci -q set "opshare.$sec.host=$ip"
+		uci -q set "opshare.$sec.transport=http"
+		uci -q set "opshare.$sec.http_port=$PORT"
+		uci -q set "opshare.$sec.token=$rtok"
+		uci -q set "opshare.$sec.name=$rname"
+		uci -q set "opshare.$sec.auto=1"
+		uci -q set "opshare.$sec.push=1"
+		CHANGED=1
+		say "配对成功 $rname（$ip）→ opshare.$sec"
+		log "paired with $rname at $ip as $sec"
+	fi
+	echo "$rid $rpw $ip $rname" >> "$FOUND"
+	PAIRED=$((PAIRED + 1))
+done < "$HITS"
+rm -f "$CANDS" "$HITS"
+
+# ------------------------------------------------------------ who is hub? ---
+# Symmetric and deterministic: highest CPU class wins, ties go to the lower id.
+# Both boxes compute the same answer from the same two numbers, so they can
+# never both step down (which would leave nobody aggregating).
+MODE=$(uci -q get opshare.main.mode 2>/dev/null)
+DESIRE=$(uci -q get opshare.main.desired_mode 2>/dev/null)
+[ -n "$DESIRE" ] || DESIRE=hub
+
+[ "$MODE" = "auto" ] || printf '%s' "$MODE" > "$RUNDIR/mode" 2>/dev/null
+
+if [ "$MODE" = "auto" ]; then
+	BESTPW=-1; BESTID=
+	while read -r pid ppw pip pnm; do
+		[ -n "$pid" ] || continue
+		if [ "$ppw" -gt "$BESTPW" ]; then
+			BESTPW=$ppw; BESTID=$pid
+		elif [ "$ppw" = "$BESTPW" ] && [ -n "$BESTID" ]; then
+			# same class: the lower id stays
+			lower=$(printf '%s\n%s\n' "$BESTID" "$pid" | sort | head -1)
+			BESTID=$lower
+		fi
+	done < "$FOUND"
+	if [ -z "$BESTID" ]; then
+		# Nobody answered. On a low-power box that usually means we sit behind
+		# the other one's WAN firewall: it can reach us, we cannot reach it, so
+		# claiming to be the hub would only duplicate work it already does.
+		# Staying passive is strictly better - it also lets the real hub push.
+		if [ "$POWER" = "1" ]; then WANT=off; else WANT=$DESIRE; fi
+	elif [ "$BESTPW" -gt "$POWER" ]; then
+		WANT=off
+	elif [ "$BESTPW" -lt "$POWER" ]; then
+		WANT=$DESIRE
+	else
+		lower=$(printf '%s\n%s\n' "$MYID" "$BESTID" | sort | head -1)
+		[ "$lower" = "$MYID" ] && WANT=$DESIRE || WANT=off
+	fi
+	# The result is stored in auto_mode, never in mode: mode keeps saying
+	# "auto" so the decision is recomputed every round (a peer may join, leave
+	# or be replaced). The daemon reads auto_mode as the effective mode.
+	OLD=$(uci -q get opshare.main.auto_mode 2>/dev/null)
+	printf '%s' "$WANT" > "$RUNDIR/mode" 2>/dev/null
+	if [ "$WANT" != "$OLD" ]; then
+		uci -q set opshare.main.auto_mode="$WANT" && CHANGED=1
+		say "自动判定：本机当 $WANT（CPU 档 $POWER，最优对端档 $BESTPW）"
+	fi
+fi
+
+[ "$CHANGED" = "1" ] && uci -q commit opshare && {
+	log "config updated, reloading service"
+	/etc/init.d/opshare reload >/dev/null 2>&1 &
+}
+
+date +%s > "$STAMP" 2>/dev/null
+[ "$PAIRED" = "0" ] && say "未发现可配对的对端"
+exit 0

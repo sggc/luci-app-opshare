@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>设备总览 · opshare</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+	<header class="topbar">
+		<div class="brand">
+			<span class="logo">◎</span>
+			<div>
+				<h1>设备总览</h1>
+				<p class="sub" id="subtitle">正在读取共享数据…</p>
+				<p class="sub" id="last-check"></p>
+			</div>
+		</div>
+		<div class="actions">
+			<button id="btn-refresh" class="btn primary" type="button">刷新</button>
+			<select id="sel-interval" title="界面刷新间隔（只读取缓存 JSON，开销很小）">
+				<option value="2000">2 秒</option>
+				<option value="3000">3 秒</option>
+				<option value="5000">5 秒</option>
+				<option value="10000">10 秒</option>
+				<option value="20000">20 秒</option>
+				<option value="30000">30 秒</option>
+			</select>
+			<label class="auto" title="勾选：每次界面刷新都让路由器立刻合并一次各节点的最新快照（服务端 force_throttle 默认 10 秒内至多一次）。不勾选：只读后台周期生成的缓存快照，不触发任何采集。">
+				<input type="checkbox" id="chk-realtime"> 即时刷新</label>
+			<label class="auto"><input type="checkbox" id="chk-offline"> 显示离线</label>
+			<button id="btn-theme" class="btn ghost" type="button" title="切换深浅色">◐</button>
+		</div>
+	</header>
+
+	<section id="stats" class="stats"></section>
+
+	<section class="panel" id="topology-panel">
+		<div class="panel-head">
+			<h2>网络拓扑</h2>
+			<span class="hint" id="topology-hint">按 WAN → 上级 LAN 自动推断层级</span>
+			<details class="note">
+				<summary>说明</summary>
+				<div class="note-body">每个节点是一张卡片：左侧为设备信息与<b>上行链路</b>（介质 / 端口 / 协商速率 / 上级节点），右侧按<b>有线 · 2.4G · 5G</b> 分道列出下挂终端。<b>卡片到终端的实际接线</b>：卡片右侧引出一条总线，总线上按介质分出支路，每台终端再从自己的介质端口上接出一小段——所以看线就知道谁接在哪、走的什么介质；节点之间的连线用流动光点表示层级方向。只有安装本插件的节点才能采集无线关联、信号、频段与协商速率。普通硬路由：<b>桥接 / AP 模式</b>下，上级 DHCP、ARP 只能看到其下终端的 IP/MAC/主机名，看不到连在哪个 AP 及无线详情；<b>路由 / NAT 模式</b>下，上游只能看到硬路由自身一个 MAC，其下设备完全不可见。可在 <code>/etc/config/opshare</code> 用 <code>config external</code> 手工声明，拓扑图会画成灰色虚线节点。<br><b>零配置配对</b>：两台都装好本插件后，各自会在两分钟内探测<b>默认网关</b>与<b>最新 DHCP 租约</b>，用 HTTP 交换身份与共享密钥自动配对——不需要填 IP、不需要授权 SSH 密钥，桥接与双 NAT 都适用。CPU 更强的一台自动当聚合者，另一台被动接收；在 <code>/etc/config/opshare</code> 里设 <code>option auto_pair 0</code> 可改为手工管理。</div>
+			</details>
+		</div>
+		<div class="topo-scroll" id="topology"></div>
+	</section>
+	<div class="topo-legend out">
+		<span><i class="lg wired"></i>有线链路</span>
+		<span><i class="lg g2"></i>2.4G 无线回程</span>
+		<span><i class="lg g5"></i>5G 无线回程</span>
+		<span><i class="lg wan"></i>拨号 / 未知</span>
+		<span><b class="lg-dot"></b>在线</span>
+		<span><b class="lg-dot off"></b>离线</span>
+		<span class="tip">点击终端定位到列表（不改筛选），点击节点卡片定位到节点详情</span>
+	</div>
+
+	<section id="nodes" class="nodes"></section>
+	<div class="role-hint" id="role-hint">角色是完全自由的标签，拓扑不决定主从：自动判定只给建议，可在每个节点卡片上自由设置</div>
+
+	<section class="panel" id="traffic-panel">
+		<div class="panel-head">
+			<h2>接口流量</h2>
+			<span class="hint" id="traffic-hint">接口累计总量 · 相邻快照增量</span>
+			<details class="note">
+				<summary>说明</summary>
+				<div class="note-body">每个接口两行：<b>上行（上传）在上、下行（下载）在下</b>，左边是该接口的累计字节，右边是相对上一次快照的增量。不计算速率、不画曲线、不保存历史。计数器重置、设备重启或时钟跳变会标注并跳过该次增量；开启硬件加速/流量卸载时计数可能偏低。</div>
+			</details>
+		</div>
+		<div id="traffic" class="traffic-rows"></div>
+	</section>
+
+	<section class="panel" id="clients-panel">
+		<div class="panel-head">
+			<h2>客户端列表</h2>
+			<div class="filters">
+				<input type="search" id="f-search" placeholder="搜索名称 / IP / MAC / SSID">
+				<select id="f-node"><option value="">全部节点</option></select>
+				<select id="f-band"><option value="">全部频段</option></select>
+				<select id="f-type">
+					<option value="">全部类型</option>
+					<option value="wifi">无线</option>
+					<option value="wired">有线</option>
+				</select>
+			</div>
+		</div>
+		<div class="table-scroll">
+			<table class="tbl">
+				<thead><tr>
+					<th class="nodebar"></th>
+					<th>设备</th><th>IP / MAC / IPv6</th><th>所属节点</th><th>连接方式</th>
+					<th>端口 / 链路速率</th><th>频段 / SSID</th><th>信号强度</th>
+					<th title="RX 是最近收到的那一帧的速率：手机空闲时的保活/管理帧用最低速，所以常显示 1~6 Mbps；TX 才是当前协商发送速率。属正常现象，看 TX 与 MCS/NSS/频宽即可。">协商速率 (RX / TX)</th>
+					<th title="断联在 session_grace 秒内视为误差，连接时长连续计算不重置；节点离线超过宽限期则冻结">连接时长 / 在线时长</th>
+				</tr></thead>
+				<tbody id="rows"></tbody>
+			</table>
+		</div>
+		<p class="empty" id="empty" hidden>没有符合条件的设备</p>
+	</section>
+
+	<footer class="foot">
+		<span id="source">数据源：—</span>
+		<span>opshare · 多设备信息共享插件</span>
+	</footer>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

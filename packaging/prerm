@@ -1,0 +1,9 @@
+#!/bin/sh
+# Stop before files are replaced or removed. postinst restarts the service on
+# upgrade, so this is safe for both paths.
+[ -n "$IPKG_INSTROOT" ] && exit 0
+PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+export PATH
+/etc/init.d/opshare stop >/dev/null 2>&1
+/etc/init.d/opshare disable >/dev/null 2>&1
+exit 0

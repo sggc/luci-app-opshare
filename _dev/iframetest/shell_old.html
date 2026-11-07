@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>iframe shell test</title>
+<style>
+	body { margin: 0; font: 13px/1.5 sans-serif; background: #ddd; }
+	#bar { padding: 8px 12px; background: #333; color: #eee; }
+	#shell { background: #fff; }
+</style>
+</head>
+<body>
+<div id="bar">LuCI 外壳（模拟）：<span id="info">等待子页面上报高度…</span></div>
+<iframe id="frame" src="page_old.html" scrolling="auto"
+	style="border:0;width:100%;height:80vh;min-height:480px;display:block;background:transparent"></iframe>
+<script>
+/* 与 src/www/luci-static/resources/view/opshare/index.js 的监听逻辑保持一致 */
+var frame = document.getElementById('frame');
+var applied = [];
+var listener = function (ev) {
+	if (ev.origin !== location.origin || !ev.data ||
+		typeof ev.data.opshareHeight === 'undefined') return;
+	var h = parseInt(ev.data.opshareHeight, 10);
+	if (!isFinite(h) || h < 200) return;
+	if (h > 12000) h = 12000;
+	if (isFinite(h) && h > 200 && h < 20000) frame.style.height = (h + 24) + "px";
+	frame.style.height = h + 'px';
+	applied.push(h);
+	document.getElementById('info').textContent =
+		'收到 ' + applied.length + ' 次，iframe = ' + frame.offsetHeight + 'px，内容 ' + h + 'px';
+};
+window.addEventListener('message', listener, false);
+</script>
+</body>
+</html>

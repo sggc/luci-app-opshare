@@ -1,0 +1,122 @@
+#!/bin/sh
+# opshare - ubus/RPC bridge for the mobile app (and anything else that speaks
+# ubus JSON-RPC). rpcd loads every executable in /usr/libexec/rpcd/ and asks it
+# for "list" at startup, then calls it with $1=call $2=<method> and the JSON
+# arguments on stdin.
+#
+# Design rule: `all` and `live` are a plain `cat` of files the daemon already
+# wrote, so a phone polling them costs the router a file read instead of a jshn
+# parse of the merged snapshot (that parse is the most expensive thing this
+# plugin does elsewhere). `info` derives a dozen scalars from the merged file in
+# a single awk pass - no daemon, no state, no staleness. It is computed on
+# demand because a passive node only rewrites all.json when its hub pushes, so
+# anything precomputed at merge time would go stale exactly there.
+#
+# Methods:
+#   all   - the merged view, schema 2, byte-for-byte the same payload the web
+#           UI consumes (/tmp/opshare/all.json). Includes ui, meta, aliases and
+#           nodes[].{node,radios,clients,leases,traffic}.
+#   live  - counter channel, ~1 KB, rebuilt every couple of seconds by the
+#           daemon. Meant for frequent polling; no clients, no topology.
+#   info  - tiny metadata block: version, node count, role, intervals.
+#           Note: on a passive node this describes the merged view, which is
+#           the hub's - i.e. `mode` is the aggregating box's effective mode,
+#           not the box you happen to be asking.
+#
+# Call it from a shell on the box with:
+#   ubus call opshare info
+#   ubus call opshare all | head -c 200
+# or over HTTP JSON-RPC on POST /ubus (session.login first), which is what
+# OPAssistant and friends do.
+
+RUNDIR=/tmp/opshare
+VER=$(cat /usr/share/opshare/version 2>/dev/null)
+[ -n "$VER" ] || VER=dev
+
+empty_all='{"schema":2,"updated":0,"ui":{},"aliases":[],"meta":{},"nodes":[]}'
+empty_live='{"schema":1,"ts":0,"nodes":[]}'
+
+# Everything `info` reports already lives in the merged file, except the node
+# count, which is one gsub over the same single line. One awk process, one pass.
+# `[{]` rather than `\{`: a bracket expression is always literal, whereas a bare
+# brace is implementation-defined in POSIX ERE.
+info_json() {
+	if [ ! -s "$1" ]; then
+		printf '{"schema":1,"api":1,"version":"%s","updated":0,"nodes":0}\n' "$VER"
+		return 0
+	fi
+	out=$(awk -v ver="$VER" '
+		function num(s, k,   re, m) {
+			re = "\"" k "\":[0-9]+"
+			if (match(s, re)) {
+				m = substr(s, RSTART, RLENGTH)
+				sub(/^[^:]*:/, "", m)
+				return m
+			}
+			return "0"
+		}
+		function str(s, k,   re, m) {
+			re = "\"" k "\":[[:space:]]*\"[^\"]*\""
+			if (match(s, re)) {
+				m = substr(s, RSTART, RLENGTH)
+				sub(/^[^:]*:[[:space:]]*"/, "", m)
+				sub(/"$/, "", m)
+				return m
+			}
+			return ""
+		}
+		{ buf = buf $0 }
+		END {
+			tmp = buf
+			nodes = gsub(/"_meta":[{]"name"/, "", tmp)
+			printf "{\"schema\":1,\"api\":1,\"version\":\"%s\",\"updated\":%s,\"nodes\":%d,\"topology\":\"%s\",\"master\":\"%s\",\"mode\":\"%s\",\"power\":%s,\"auto_peers\":%s,\"intervals\":{\"refresh\":%s,\"idle\":%s,\"traffic\":%s,\"live_ms\":%s}}\n",
+				ver, num(buf, "updated"), nodes, str(buf, "topology"),
+				str(buf, "master"), str(buf, "eff_mode"), num(buf, "power"),
+				num(buf, "auto_peers"), num(buf, "fast_interval"),
+				num(buf, "interval"), num(buf, "fast_traffic"),
+				num(buf, "live_ms")
+		}
+	' "$1" 2>/dev/null)
+	[ -n "$out" ] || out=$(printf '{"schema":1,"api":1,"version":"%s","updated":0,"nodes":0}' "$VER")
+	printf '%s\n' "$out"
+}
+
+case "$1" in
+list)
+	# Signature table: {} means "no arguments". rpcd turns each key into a
+	# ubus method, and ubus rejects unexpected arguments, which is what we want
+	# for a read-only contract.
+	echo '{"all":{},"live":{},"info":{}}'
+	;;
+call)
+	# Drain stdin: rpcd writes the JSON arguments there and closes it. Reading
+	# it keeps the pipe from complaining even though no method takes arguments.
+	cat >/dev/null 2>&1
+
+	case "$2" in
+	all)
+		# cat is atomic against the daemon's mv-rename write, so a polling
+		# client never sees a half-written file.
+		if [ -s "$RUNDIR/all.json" ]; then
+			cat "$RUNDIR/all.json" 2>/dev/null || echo "$empty_all"
+		else
+			echo "$empty_all"
+		fi
+		;;
+	live)
+		if [ -s "$RUNDIR/live.json" ]; then
+			cat "$RUNDIR/live.json" 2>/dev/null || echo "$empty_live"
+		else
+			echo "$empty_live"
+		fi
+		;;
+	info)
+		info_json "$RUNDIR/all.json"
+		;;
+	*)
+		# Unknown method: rpcd already filters these, but stay well-formed.
+		echo '{}'
+		;;
+	esac
+	;;
+esac

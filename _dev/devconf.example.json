@@ -1,0 +1,4 @@
+{
+  "ac": { "host": "192.168.1.1", "user": "root", "password": "<password>" },
+  "ap": { "host": "192.168.10.1", "user": "root", "password": "<password>" }
+}

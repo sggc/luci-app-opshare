@@ -1,0 +1,169 @@
+#!/bin/sh
+# opshare-traffic v1 - the cheapest interface counter sampler we can build.
+#
+# Why a separate program: the counter snapshot is the ONLY thing that has to be
+# sampled at a fine granularity (1-2 s). The full collector costs 0.5-1.1 s of
+# CPU and cannot run that often. This script costs ~10 ms, because a sample is
+# exactly ONE fork:
+#
+#   * no `uci` call            config comes in through the environment
+#   * no `date` call           dt comes from /proc/uptime (monotonic, so an
+#                              NTP step can never produce a bogus delta)
+#   * no boot_id read          uptime going backwards IS a reboot
+#   * one awk process          reads /proc/net/dev, compares, writes both files
+#
+# Inputs (all in RAM, nothing on flash):
+#   traffic.ifaces   ifname per line          - written by the full collector
+#   traffic.kinds    ifname|kind              - written by the full collector
+#   boot.ref         <epoch> <uptime_cs>      - wall-clock anchor, ~1 fork/15min
+#
+# Outputs:
+#   traffic.state  <ifname>|<mono_cs>|<rx>|<tx>
+#   traffic.snap   <ifname>|<kind>|<rx>|<tx>|<d_rx>|<d_tx>|<ts>|<prev_ts>|<dt>|<state>
+#
+# state values: ok | baseline | reboot | reset | wrap32 | clock
+#
+# Environment: OP_TRAFFIC=0 disables sampling; OP_NOW=<epoch> lets the caller
+# pass the wall clock it already knows (saves the anchor read).
+
+RUNDIR=/tmp/opshare
+IFLIST="$RUNDIR/traffic.ifaces"
+IFKINDS="$RUNDIR/traffic.kinds"
+TSTATE="$RUNDIR/traffic.state"
+TSNAP="$RUNDIR/traffic.snap"
+BREF="$RUNDIR/boot.ref"
+
+[ "${OP_TRAFFIC:-1}" = "1" ] || exit 0
+[ -r /proc/net/dev ] || exit 0
+mkdir -p "$RUNDIR" 2>/dev/null
+
+# ---- monotonic clock, centiseconds, no fork --------------------------------
+IFS=' ' read -r _up _rest < /proc/uptime 2>/dev/null || exit 0
+_sec=${_up%%.*}
+_frac=${_up#*.}
+case "$_sec" in ''|*[!0-9]*) exit 0 ;; esac
+case "$_frac" in
+	'')  _frac=00 ;;
+	?)   _frac="${_frac}0" ;;          # 12.5 -> 50 centiseconds
+	*)   _frac=${_frac%${_frac#??}} ;; # keep exactly two digits
+esac
+MONO="${_sec}${_frac}"
+
+# ---- wall clock: anchored once, then derived from the monotonic clock ------
+_wn=
+if [ -n "${OP_NOW:-}" ]; then
+	case "$OP_NOW" in ''|*[!0-9]*) ;; *) _wn=$OP_NOW ;; esac
+fi
+if [ -z "$_wn" ]; then
+	_be=0; _bu=0
+	[ -r "$BREF" ] && IFS=' ' read -r _be _bu _rest < "$BREF" 2>/dev/null
+	case "$_be" in ''|*[!0-9]*) _be=0 ;; esac
+	case "$_bu" in ''|*[!0-9]*) _bu=0 ;; esac
+	# re-anchor at most every 15 minutes: one `date` fork per 900 samples
+	if [ "$_be" -gt 0 ] && [ "$_bu" -gt 0 ] && [ "$MONO" -ge "$_bu" ] &&
+		[ $((MONO - _bu)) -lt 90000 ]; then
+		_wn=$((_be + (MONO - _bu) / 100))
+	else
+		_wn=$(date +%s 2>/dev/null)
+		case "$_wn" in ''|*[!0-9]*) _wn=0 ;; esac
+		[ "$_wn" -gt 0 ] && printf '%s %s\n' "$_wn" "$MONO" > "$BREF"
+	fi
+fi
+[ "$_wn" -gt 0 ] || exit 0
+
+# ---- first run without the collector's interface list ---------------------
+# (one-off, only until the full collector has written its list)
+if [ ! -s "$IFLIST" ]; then
+	_br=$(uci -q get network.lan.device 2>/dev/null); [ -n "$_br" ] || _br=br-lan
+	_wan=$(uci -q get network.wan.device 2>/dev/null)
+	{ printf '%s\n' "$_br"; printf '%s\n' "$_wan"
+	  ls "/sys/class/net/$_br/brif/" 2>/dev/null; } |
+		sed '/^$/d' | sort -u > "$IFLIST"
+fi
+[ -f "$TSTATE" ] || : > "$TSTATE"
+
+# Unique temp names: this sampler can run from a timer, from a browser request
+# and from a peer polling our counters at the same time. Two runs sharing one
+# .tmp path would truncate each other's output and publish an empty snapshot.
+TMP_STATE="$TSTATE.$$.tmp"
+TMP_SNAP="$TSNAP.$$.tmp"
+trap 'rm -f "$TMP_STATE" "$TMP_SNAP"' EXIT INT TERM
+: > "$TMP_STATE"
+: > "$TMP_SNAP"
+
+awk -v NOW="$_wn" -v MONO="$MONO" \
+	-v L="$IFLIST" -v K="$IFKINDS" -v S="$TSTATE" \
+	-v O="$TMP_STATE" -v P="$TMP_SNAP" '
+	BEGIN {
+		while ((getline x < L) > 0) {
+			gsub(/^[ \t]+|[ \t]+$/, "", x)
+			if (x != "") w[x] = 1
+		}
+		close(L)
+		while ((getline x < K) > 0) {
+			split(x, a, "|")
+			if (a[1] != "") kind[a[1]] = a[2]
+		}
+		close(K)
+		while ((getline l < S) > 0) {
+			if (l == "") continue
+			split(l, a, "|")
+			if (a[1] == "" || a[1] == "B") continue
+			pm[a[1]] = a[2] + 0
+			prx[a[1]] = a[3] + 0
+			ptx[a[1]] = a[4] + 0
+		}
+		close(S)
+	}
+	NR > 2 {
+		name = $1
+		sub(/:$/, "", name)
+		sub(/^[ \t]+/, "", name)
+		if (!(name in w)) next
+		r = $2 + 0
+		t = $10 + 0
+		st = "ok"; dr = 0; dx = 0; dt = 0; pts = 0
+		if (!(name in pm)) st = "baseline"
+		else {
+			dcs = MONO - pm[name]
+			# uptime went backwards: the box rebooted, every counter is new
+			if (dcs < 0) st = "reboot"
+			else if (dcs > 8640000) st = "clock"
+			else {
+				dt = int((dcs + 50) / 100)
+				dr = r - prx[name]
+				dx = t - ptx[name]
+				# a decreasing counter is a reset OR a 32-bit rollover;
+				# only compensate when the old value sat in the upper half
+				if (dr < 0) {
+					if (prx[name] > 2147483648 && prx[name] <= 4294967296 && r < 2147483648) {
+						dr = 4294967296 - prx[name] + r; st = "wrap32"
+					} else st = "reset"
+				}
+				if (dx < 0) {
+					if (ptx[name] > 2147483648 && ptx[name] <= 4294967296 && t < 2147483648) {
+						dx = 4294967296 - ptx[name] + t
+						if (st != "reset") st = "wrap32"
+					} else st = "reset"
+				}
+				if (st == "reset") { dr = 0; dx = 0 }
+				pts = NOW - dt
+			}
+		}
+		order[++o] = name
+		snap[name] = sprintf("%s|%s|%.0f|%.0f|%.0f|%.0f|%d|%d|%d|%s",
+			name, (name in kind ? kind[name] : "port"), r, t, dr, dx,
+			NOW, pts, dt, st)
+		cr[name] = r; ct[name] = t
+	}
+	END {
+		for (i = 1; i <= o; i++) {
+			k = order[i]
+			printf "%s|%.0f|%.0f|%.0f\n", k, MONO, cr[k], ct[k] > O
+			print snap[k] > P
+		}
+		close(O); close(P)
+	}' /proc/net/dev
+
+mv "$TMP_STATE" "$TSTATE" 2>/dev/null || : > "$TSTATE"
+mv "$TMP_SNAP" "$TSNAP" 2>/dev/null || : > "$TSNAP"

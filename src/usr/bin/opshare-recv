@@ -1,0 +1,22 @@
+#!/bin/sh
+# opshare-recv - accept a merged snapshot on stdin, validate and install it.
+# Used by the hub to push the aggregated view to peers behind NAT.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+RUNDIR=/tmp/opshare
+mkdir -p "$RUNDIR"
+tmp="$RUNDIR/all.json.in.$PPID"
+
+head -c 262144 > "$tmp" 2>/dev/null || { rm -f "$tmp"; echo 'INVALID'; exit 1; }
+if [ -s "$tmp" ] && head -c 1 "$tmp" | grep -q '{' && grep -q '"schema"' "$tmp"; then
+	mv "$tmp" "$RUNDIR/all.json"
+	# standalone page support, only when explicitly enabled
+	if [ "$(uci -q get opshare.main.public_data 2>/dev/null)" = "1" ] && [ -d /www/opshare ]; then
+		cp "$RUNDIR/all.json" /www/opshare/all.json.tmp 2>/dev/null && \
+			mv /www/opshare/all.json.tmp /www/opshare/all.json
+	fi
+	printf 'Content-Type: text/plain\r\n\r\nOK\n'
+else
+	rm -f "$tmp"
+	printf 'Content-Type: text/plain\r\n\r\nINVALID\n'
+	exit 1
+fi

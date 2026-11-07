@@ -1,0 +1,229 @@
+name: build
+
+# Three jobs, one package:
+#   test     - everything that fails without a router: shell syntax, the JSON
+#              files, the headless UI test, the offline pairing test, and a
+#              reproducibility check (build twice, compare hashes).
+#   package  - build the .ipk in both container formats plus the opkg feed
+#              index, and publish them as a workflow artifact.
+#   release  - on a v* tag only: attach the same files to a GitHub Release.
+#
+# There is deliberately no build matrix. Everything in the package is shell and
+# static web assets, so `Architecture: all` is not a claim that needs verifying
+# per CPU - there is no compiled object to differ. A matrix here would produce
+# byte-identical files five times over.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+# Needed to create the Release. Nothing else in here writes to the repo.
+permissions:
+  contents: write
+
+concurrency:
+  # A tag push must never cancel an in-flight release build.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  # Fixed epoch => byte-identical packages on every runner. build-ipk.py reads
+  # this and stamps every tar entry with it.
+  SOURCE_DATE_EPOCH: '1700000000'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate packaging inputs
+        run: python packaging/build-ipk.py --check
+
+      - name: UI smoke test (headless)
+        run: node _dev/uitest.js
+
+      - name: Pairing logic test (offline, stubbed uci/wget)
+        run: sh _dev/pairtest.sh
+
+      - name: Builds are reproducible
+        run: |
+          set -eu
+          python packaging/build-ipk.py --legacy-ar >/dev/null
+          a=$(cat dist/*.ipk.sha256 dist/legacy/*.ipk.sha256)
+          rm -rf dist
+          python packaging/build-ipk.py --legacy-ar >/dev/null
+          b=$(cat dist/*.ipk.sha256 dist/legacy/*.ipk.sha256)
+          if [ "$a" != "$b" ]; then
+            echo "two builds of the same tree differ:" >&2
+            printf '%s\n---\n%s\n' "$a" "$b" >&2
+            exit 1
+          fi
+          echo "reproducible: $(echo "$a" | wc -l) package(s) identical across builds"
+
+  package:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Resolve version
+        id: ver
+        run: |
+          set -eu
+          file_v=$(cat src/usr/share/opshare/version)
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            v="${GITHUB_REF_NAME#v}"
+            if [ "$v" != "$file_v" ]; then
+              # Not fatal: the build patches the packaged version file so the
+              # UI and the control file still agree. But a tag that disagrees
+              # with the tree means the bump was not committed, so say so.
+              echo "::warning::tag is $v but src/usr/share/opshare/version is $file_v; the packaged file will be patched to $v - commit the bump to keep them in sync"
+            fi
+          else
+            v="$file_v"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "building version $v"
+
+      - name: Build .ipk (modern + classic container)
+        run: python packaging/build-ipk.py --legacy-ar --version "${{ steps.ver.outputs.version }}"
+
+      - name: Verify the packages are installable
+        run: |
+          set -eu
+          python packaging/verify-ipk.py dist/*.ipk dist/legacy/*.ipk
+
+      - name: Generate opkg feed index
+        run: |
+          set -eu
+          python packaging/make-index.py
+          python packaging/make-index.py dist/legacy
+
+      - name: Checksums
+        run: |
+          set -eu
+          cd dist
+          # Flat names, because release assets are flat: `sha256sum -c` has to
+          # work on the files as downloaded, not on the directory layout here.
+          sha256sum --text *.ipk legacy/*.ipk | sed 's|legacy/||' > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipk-${{ steps.ver.outputs.version }}-${{ github.sha }}
+          path: |
+            dist/*.ipk
+            dist/*.sha256
+            dist/SHA256SUMS
+            dist/Packages
+            dist/Packages.gz
+            dist/legacy/*.ipk
+            dist/legacy/*.sha256
+            dist/legacy/Packages
+            dist/legacy/Packages.gz
+          if-no-files-found: error
+
+      - name: Keep the files around for the release job
+        uses: actions/upload-artifact@v4
+        with:
+          # Separate artifact so the release job does not have to unpack a name
+          # it has to reconstruct from the version and sha.
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          V: ${{ needs.package.outputs.version }}
+        run: |
+          set -eu
+          cat > notes.md <<EOF
+          luci-app-opshare ${V}
+
+          Architecture: **all** - the same file installs on aarch64, mipsel,
+          arm and x86. The package is pure shell plus static web assets, so
+          there is no per-CPU build.
+
+          ### Install (OpenWrt / ImmortalWrt 24.10 and newer, opkg)
+
+          \`\`\`sh
+          opkg install --force-reinstall \\
+            https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/luci-app-opshare_${V}_all.ipk
+          \`\`\`
+
+          ### Install (21.02 / 22.03, classic container)
+
+          Those opkg builds cannot read the modern container. Grab the asset
+          whose name ends in \`_legacy.ipk\` instead of the one above:
+
+          \`\`\`sh
+          opkg install --force-reinstall \\
+            https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/luci-app-opshare_${V}_all_legacy.ipk
+          \`\`\`
+
+          The legacy build has no feed index here: a release cannot hold two
+          assets named \`Packages\`. If you want \`opkg upgrade\` on an old
+          release, take \`Packages\`/\`Packages.gz\` from the run artifact
+          \`ipk-${V}-*\` instead.
+
+          ### As a feed (24.10+, gets you \`opkg upgrade\`)
+
+          \`\`\`sh
+          echo "src/gz opshare https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}" \\
+            >> /etc/opkg/customfeeds.conf
+          opkg update && opkg install luci-app-opshare
+          \`\`\`
+
+          The feed is unsigned, so either set \`option check_signature 0\` in
+          \`/etc/opkg.conf\` or install the file directly as shown above.
+
+          ### Checksums
+
+          \`\`\`
+          $(cat dist/SHA256SUMS)
+          \`\`\`
+          EOF
+
+          gh release create "$TAG" \
+            --title "luci-app-opshare $V" \
+            --notes-file notes.md \
+            dist/luci-app-opshare_*.ipk \
+            dist/luci-app-opshare_*.ipk.sha256 \
+            dist/SHA256SUMS \
+            dist/Packages \
+            dist/Packages.gz \
+            dist/legacy/luci-app-opshare_*.ipk \
+            dist/legacy/luci-app-opshare_*.ipk.sha256
