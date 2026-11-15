@@ -10,7 +10,9 @@
 #   sh packaging/build-apk.sh [version]
 #   APK_BIN=/path/to/apk.static sh packaging/build-apk.sh 1.0.1
 #
-# Needs apk-tools 3.x. On a machine without it, use an Alpine container:
+# Needs apk-tools 3.x *with the mkpkg applet*. A router's runtime apk is
+# usually a trimmed build (verified: OpenWrt/PonWrt 3.0.5 ships add/del/info
+# but no mkpkg), so use an Alpine container or the static apk binary:
 #   docker run --rm -v "$PWD":/work -w /work alpine:3.23 \
 #       sh packaging/build-apk.sh
 #
@@ -31,7 +33,9 @@ APKVER="$VER-r1"
 if command -v "$APK" >/dev/null 2>&1; then :
 elif [ -x "$APK" ]; then :
 else
-	echo "ERROR: apk-tools 3.x not found (set APK_BIN or run in alpine:3.23)" >&2
+	echo "ERROR: apk-tools 3.x with 'mkpkg' not found." >&2
+	echo "       A router's runtime apk is often built without mkpkg." >&2
+	echo "       Use an Alpine container or APK_BIN=/path/to/apk.static." >&2
 	exit 1
 fi
 
