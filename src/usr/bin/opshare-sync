@@ -1,10 +1,16 @@
 #!/bin/sh
 # opshare-sync v2 - collect local + remote snapshots and merge them.
 #
-# hub  : poll every configured peer, merge into /tmp/opshare/all.json and push
-#        the merged view back to each peer (works through NAT / dual DHCP).
-# pull : only fetch an already merged snapshot from a hub.
-# off  : do nothing; still serves the LuCI page and the CGI endpoint.
+# hub  : poll configured peers AND merge snapshots that downstream boxes
+#        reported themselves via POST a=exchange, then push the merged view.
+# pull : POST our own snapshot to the hub and take the merged view from the
+#        same response. Only an outbound connection is needed, so double NAT
+#        and a REJECT-ing WAN firewall do not matter.
+# off  : same as pull; still serves the LuCI page and the CGI endpoint.
+#
+# Zero-config pairing: a newly installed box finds its gateway with a=hello,
+# learns the hub's token, then reports itself every cycle. The hub needs no
+# inbound firewall rule, no SSH key and no manual `config peer` section.
 #
 # Any number of peers is supported; each peer may use ssh or http transport.
 # Roles (master / slave / bridge) are explicit in /etc/config/opshare and are
@@ -220,7 +226,25 @@ pull_cb() {
 	config_get ptok "$sec" token
 	[ -n "$ptok" ] || ptok="$TOKEN"
 	raw="$RUNDIR/pull.$$"
-	http_cat "$(http_url "$phost" "$phttp" "$ptok" all)" > "$raw" 2>/dev/null
+	# One POST carries our own snapshot upstream and brings the merged view
+	# back in the same response. A downstream box can always initiate this;
+	# the hub never has to connect back through our WAN firewall. Fall back
+	# to a plain GET so older hubs (without a=exchange) keep working.
+	posted=0
+	if [ -s "$RUNDIR/self.json" ]; then
+		myid=$(cat "$RUNDIR/id" 2>/dev/null)
+		[ -n "$myid" ] || myid=unknown
+		xurl="$(http_url "$phost" "$phttp" "$ptok" exchange)&id=$myid"
+		if [ "$HAS_WGET" = "1" ]; then
+			wget -q -T "$TIMEOUT" --post-file="$RUNDIR/self.json" \
+				-O "$raw" "$xurl" 2>/dev/null && posted=1
+		elif [ "$HAS_CURL" = "1" ]; then
+			curl -fsS --max-time "$TIMEOUT" --data-binary @"$RUNDIR/self.json" \
+				"$xurl" > "$raw" 2>/dev/null && posted=1
+		fi
+	fi
+	[ "$posted" = "1" ] ||
+		http_cat "$(http_url "$phost" "$phttp" "$ptok" all)" > "$raw" 2>/dev/null
 	if valid_json "$raw"; then
 		mv "$raw" "$ALL"
 		date +%s > "$RUNDIR/pull.ts" 2>/dev/null
@@ -269,7 +293,7 @@ external_cb() {
 
 sync_once() {
 	local now raw sec penabled phost puser pport ptrans pkey ptoken pname ppush phttp
-	local SELF_ROLE SELF_BASIS
+	local SELF_ROLE SELF_BASIS rf rsec rmeta rts rhost rage rname rstale REPORT_TTL
 	# Per-process scratch files: a manual refresh may overlap the background
 	# loop. Private names + atomic mv mean no lock, no deadlock, no duplicate
 	# nodes (previously both appended to the same nodes.list).
@@ -330,6 +354,34 @@ sync_once() {
 	# ---- remote nodes ----
 	config_foreach sync_peer peer
 
+	# ---- nodes that reported themselves over HTTP (zero-config pairing) ----
+	# A downstream box can reach its gateway, but the gateway usually cannot
+	# connect back through the downstream WAN firewall (input=REJECT). Those
+	# nodes POST their own snapshot to a=exchange; merging them here means the
+	# user never has to open a port, add a peer section or exchange SSH keys.
+	REPORT_TTL=$((INTERVAL * 4))
+	[ "$REPORT_TTL" -lt 180 ] && REPORT_TTL=180
+	for rf in "$RUNDIR"/reported/*.json; do
+		[ -r "$rf" ] || continue
+		rsec=${rf##*/}; rsec=${rsec%.json}
+		rmeta="$RUNDIR/reported/$rsec.meta"
+		[ -r "$rmeta" ] || continue
+		IFS='|' read -r rts rhost < "$rmeta" 2>/dev/null
+		case "$rts" in ''|*[!0-9]*) continue ;; esac
+		rage=$((now - rts)); [ "$rage" -ge 0 ] || rage=0
+		if [ "$rage" -gt "$REPORT_TTL" ]; then
+			rm -f "$rf" "$rmeta"
+			continue
+		fi
+		rname=$(json_str hostname "$rf")
+		[ -n "$rname" ] || rname="$rsec"
+		rstale=0
+		[ "$rage" -gt "$((INTERVAL * 2))" ] && rstale=1
+		make_node "$rf" "report_$rsec" "$rname" "$rhost" 1 "$rts" "$rstale" 0 \
+			"node" "" "主动上报（无需放行入站）" "report_$rsec"
+		echo "$NODES/report_$rsec.json.$$" >> "$LIST"
+	done
+
 	# ---- user aliases + manually declared unmanaged devices ----
 	ALIAS_JSON=$(cat "$ALIASES" 2>/dev/null | sed 's/,$//')
 	config_foreach external_cb external
@@ -389,6 +441,12 @@ sync_peer() {
 	config_get penabled "$sec" enabled 1
 	[ "$penabled" = "1" ] || [ "$penabled" = "on" ] || return 0
 	config_get phost "$sec" host; [ -n "$phost" ] || return 0
+	# A peer that points at ourselves (left over from an earlier pairing) can
+	# never work and floods the log every cycle. Ignore it: the real node will
+	# show up through its own exchange report instead.
+	case "$phost" in 127.*|::1|localhost) return 0 ;; esac
+	_self_lan=$(uci -q get network.lan.ipaddr 2>/dev/null)
+	if [ -n "$_self_lan" ] && [ "$phost" = "$_self_lan" ]; then return 0; fi
 	config_get puser "$sec" user; [ -n "$puser" ] || puser=root
 	config_get pport "$sec" port; [ -n "$pport" ] || pport=22
 	config_get ptrans "$sec" transport; [ -n "$ptrans" ] || ptrans=ssh
@@ -588,6 +646,12 @@ loop() {
 		fi
 
 		# --- 3. merge: cheap, follows the collection ------------------------
+		# A downstream box just POSTed its snapshot (a=exchange). Merge on the
+		# next tick instead of making it wait a whole collection cycle.
+		if [ -e "$RUNDIR/reported.new" ]; then
+			rm -f "$RUNDIR/reported.new" 2>/dev/null
+			need_merge=1
+		fi
 		if [ "$need_merge" = "1" ]; then
 			need_merge=0
 			case "$EFF" in
@@ -600,7 +664,15 @@ loop() {
 						FAST_MERGE=1 sync_once || log "fast merge failed"
 					fi
 					;;
-				*) [ -s "$ALL" ] || sync_once ;;
+				*)
+					# A passive node must still report itself and refresh the
+					# merged view on every cycle. sync_once is cheap here: it
+					# takes the pull_merged() early return (one outbound HTTP
+					# request), with no collection and no peer polling. Only
+					# calling it when all.json is MISSING left downstream boxes
+					# frozen on their first cached copy forever.
+					sync_once || log "passive refresh failed"
+					;;
 			esac
 			[ "$EFF" = "hub" ] && push_at=$((now + 3))
 		fi

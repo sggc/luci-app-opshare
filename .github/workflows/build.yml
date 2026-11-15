@@ -63,6 +63,9 @@ jobs:
       - name: Interface enumeration test (stubbed sysfs / procfs)
         run: sh _dev/ifacetest.sh
 
+      - name: Zero-config pairing test (POST exchange)
+        run: sh _dev/exchangetest.sh
+
       - name: Builds are reproducible
         run: |
           set -eu

@@ -7,6 +7,14 @@ QWRT 的客户端、无线信息、DHCP 租约和接口流量合并成一份视�
 纯 shell + 静态网页，无编译产物，`Architecture: all`——同一个 `.ipk` 通吃
 aarch64、mipsel、arm、x86。
 
+## 零配置互联
+
+两台设备装好插件即可互相发现并共享数据，**不需要改任何路由器设置**：不用开端口、不用加防火墙规则、不用配 SSH 密钥、不用手工填对端 IP。
+
+原理是只走**出站**连接。下挂路由能访问上级网关，但上级通常连不回下级（WAN 默认 `input=REJECT`，双 NAT 更不可能）。所以下级每隔一个采集周期就把自己的快照 POST 给上级的 `a=exchange`，上级存下这份快照并把当前合并视图**在同一个响应里**带回来。一次单向请求完成双向交换，N 台设备同理。
+
+配对本身也无需配置：`a=hello` 只在私网应答，自动交换 id / token / CPU 档位 / 角色，CPU 强的一台当聚合者。约半分钟内所有节点收敛到同一份视图。旧版本没有 `a=exchange` 时会回退到原来的 GET 拉取，不影响升级。
+
 ## 功能
 
 - 零配置配对：自动发现同网段的其他路由器
@@ -108,6 +116,7 @@ sh packaging/build-apk.sh                  # APK v3，需 apk mkpkg
 node _dev/uitest.js              # 前端渲染（无浏览器）
 sh _dev/pairtest.sh              # 配对与合并逻辑（桩掉 uci/wget/ip）
 sh _dev/ifacetest.sh             # 接口枚举（桩掉 sysfs/procfs）
+sh _dev/exchangetest.sh          # 零配置配对协议（桩掉 CGI 环境）
 python _dev/check-contract.py    # 数据字段与接口文档对账
 python packaging/verify-ipk.py
 ```

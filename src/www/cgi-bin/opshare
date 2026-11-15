@@ -6,6 +6,14 @@
 #   GET  ...?t=TOKEN&a=traffic           -> this node's counter rows (peers)
 #   GET  ...?t=TOKEN&a=sync              -> trigger one on-demand sync
 #   POST ...?t=TOKEN&a=recv              -> push merged snapshot
+#   POST ...?t=TOKEN&a=exchange&id=ID    -> report this node, get merged view
+#
+# a=exchange is what makes pairing work with NO router configuration at all.
+# A downstream box behind NAT can reach its gateway, but the gateway cannot
+# connect back through the downstream WAN firewall (input=REJECT by default).
+# So the downstream box POSTs its own single-node snapshot here, and this
+# endpoint replies with the current merged view. One outbound request carries
+# data both ways: no inbound rule, no SSH key, no manual peer section.
 #
 # a=live and a=traffic are polled every couple of seconds by the page and by
 # the hub, so they get a dedicated path with no uci call and no per-field
@@ -193,8 +201,48 @@ case "$action" in
 			echo 'INVALID'
 		fi
 		;;
+	exchange)
+		RD=/tmp/opshare
+		len=${CONTENT_LENGTH:-0}
+		case "$len" in ''|*[!0-9]*) len=0 ;; esac
+		rid=$(qget id)
+		case "$rid" in
+			''|*[!A-Za-z0-9_-]*) rid= ;;
+		esac
+		[ -n "$rid" ] || rid=$(printf '%s' "${REMOTE_ADDR:-unknown}" | tr -c 'A-Za-z0-9' '_')
+		mkdir -p "$RD/reported" 2>/dev/null
+		body="$RD/reported/$rid.json.$$"
+		if [ "$len" -gt 0 ] && [ "$len" -le 262144 ]; then
+			head -c "$len" > "$body" 2>/dev/null
+			# A real single-node snapshot has both `schema` and `node`.
+			# `a=recv` (a merged view) also has schema, so require `node` too.
+			if [ -s "$body" ] && head -c 1 "$body" | grep -q '{' &&
+				grep -q '"schema"' "$body" && grep -q '"node"' "$body"; then
+				mv "$body" "$RD/reported/$rid.json"
+				printf '%s|%s\n' "$(date +%s)" "${REMOTE_ADDR:-}" \
+					> "$RD/reported/$rid.meta"
+				# Nudge the daemon to merge now instead of waiting for the
+				# next full collection cycle, so a freshly installed box shows
+				# up on the hub within a second of its first report.
+				: > "$RD/reported.new" 2>/dev/null
+				hdr_json
+				if [ -s "$RD/all.json" ]; then
+					cat "$RD/all.json"
+				else
+					echo '{"schema":2,"updated":0,"ui":{},"aliases":[],"meta":{},"nodes":[]}'
+				fi
+			else
+				rm -f "$body"
+				hdr_json
+				echo '{"ok":0,"reason":"invalid snapshot"}'
+			fi
+		else
+			hdr_json
+			echo '{"ok":0,"reason":"empty body"}'
+		fi
+		;;
 	*)
 		hdr_text
-		echo 'opshare: a=collect|all|live|traffic|sync|recv'
+		echo 'opshare: a=collect|all|live|traffic|sync|recv|exchange'
 		;;
 esac
