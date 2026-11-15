@@ -66,6 +66,23 @@ O3=$(QUERY_STRING='t=secret&a=exchange&id=opsharetest' CONTENT_LENGTH=0 \
 	sh "$CGI" < /dev/null)
 printf '%s' "$O3" | grep -q '"ok":0' && ok "空 body 被拒绝" || no "空 body 未拒绝"
 
+# A machine-to-machine request must not look like a human watching the page.
+# The downstream reports every 30 s; if that refreshed the watch window the
+# aggregator would sit in the fast profile (12 s collections) forever with
+# nobody looking, which measured at 3x the idle CPU on the lab box.
+printf '0' > "$RD/want"
+QUERY_STRING='t=secret&a=exchange&id=opsharetest' CONTENT_LENGTH="$BODY" \
+	REMOTE_ADDR=192.168.10.191 REQUEST_METHOD=POST \
+	sh "$CGI" < "$T/self.json" >/dev/null
+[ "$(cat "$RD/want" 2>/dev/null)" = "0" ] &&
+	ok "exchange 不冒充人工浏览（不刷新 watch 窗口）" ||
+	no "exchange 刷新了 watch 窗口，聚合端会被永久钉在快采模式"
+
+# ...but a real page request still has to wake the daemon up.
+QUERY_STRING='t=secret&a=all' REQUEST_METHOD=GET sh "$CGI" >/dev/null
+[ "$(cat "$RD/want" 2>/dev/null)" != "0" ] &&
+	ok "页面请求 a=all 仍会刷新 watch" || no "页面请求不再刷新 watch，快采模式会失效"
+
 # The client side must use an outbound POST with the snapshot, and the hub
 # side must merge whatever was reported without any peer section.
 grep -q 'post-file' "$SYNC" && ok "被动节点用 wget --post-file 上报" || no "缺少 POST 上报"
@@ -75,6 +92,17 @@ grep -q 'reported/\*.json\|reported/' "$SYNC" && ok "hub 扫描主动上报的�
 grep -q '127\.\*|::1|localhost' "$SYNC" && ok "跳过指向自身的遗留 peer" || no "自指 peer 未处理"
 grep -q 'passive refresh failed' "$SYNC" &&
 	ok "被动节点每周期主动刷新（不会冻结在第一份缓存）" || no "被动节点缺少周期刷新"
+
+# Flash wear: /etc/opshare/identity is on the overlay, and opshare-peer runs
+# every 2 minutes. Rewriting it unconditionally cost one flash write per probe
+# for a value that never changed. The write has to be content-compared.
+PEER="$ROOT/src/usr/bin/opshare-peer"
+grep -q '_IDENT_NEW' "$PEER" &&
+	ok "identity 幂等写入（内容不变就不碰 flash）" ||
+	no "identity 每轮无条件重写，会白白磨损 flash"
+grep -q '> /tmp/opshare/id' "$CGI" &&
+	ok "CGI 兜底身份只写 /tmp（重启后可重算，不写 flash）" ||
+	no "CGI 仍在写 /etc"
 
 printf '\n==> %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]

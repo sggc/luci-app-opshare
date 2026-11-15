@@ -100,7 +100,13 @@ esac
 printf '%s' "$MYID" > "$RUNDIR/id" 2>/dev/null
 printf '%s' "$POWER" > "$RUNDIR/power" 2>/dev/null
 printf '%s' "$AUTO" > "$RUNDIR/autopair" 2>/dev/null
-printf 'MYID=%s\nMYNAME=%s\n' "$MYID" "$MYNAME" > "$IDENT"
+# /etc/opshare/identity lives on flash. Rewriting it unconditionally on every
+# probe round (this script runs every 2 minutes) burned one flash write for a
+# value that had not changed - 720 writes a day, forever, on a router with a
+# 2045-block erase budget. Only write when the content actually differs.
+_IDENT_NEW=$(printf 'MYID=%s\nMYNAME=%s' "$MYID" "$MYNAME")
+[ "$(cat "$IDENT" 2>/dev/null)" = "$_IDENT_NEW" ] ||
+	printf '%s\n' "$_IDENT_NEW" > "$IDENT" 2>/dev/null
 
 # --------------------------------------------------------------- http glue --
 HAS_WGET=0; HAS_UF=0; HAS_CURL=0

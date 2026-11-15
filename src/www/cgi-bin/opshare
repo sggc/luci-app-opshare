@@ -77,8 +77,16 @@ case "$QUERY" in
 		[ -n "$_seed" ] || _seed="$HNAME"
 		HID=$(printf '%s' "$_seed" | md5sum 2>/dev/null | cut -c1-12)
 		[ -n "$HID" ] || HID=$(printf '%s' "$_seed" | cksum | cut -d' ' -f1)
-		mkdir -p /etc/opshare 2>/dev/null
-		printf 'MYID=%s\nMYNAME=%s\n' "$HID" "$HNAME" > /etc/opshare/identity 2>/dev/null
+		# Runtime copy only: this path is reachable from a pairing probe on
+		# every handshake, and /etc is flash. The value is a pure function of
+		# the LAN MAC, so it can be recomputed after any reboot. Persist to
+		# /etc only when no identity exists at all (first ever handshake on a
+		# box that has never run opshare-peer) so the id stays stable.
+		mkdir -p /tmp/opshare 2>/dev/null
+		printf '%s' "$HID" > /tmp/opshare/id 2>/dev/null
+		[ -s /etc/opshare/identity ] ||
+			{ mkdir -p /etc/opshare 2>/dev/null
+			  printf 'MYID=%s\nMYNAME=%s\n' "$HID" "$HNAME" > /etc/opshare/identity 2>/dev/null; }
 	fi
 	# Same reasoning for the CPU class: it decides who aggregates, so a wrong
 	# default would make both boxes step down (or both aggregate).
@@ -169,7 +177,17 @@ if [ -n "$TOKEN" ] && [ "$given" != "$TOKEN" ]; then
 	printf 'Status: 403 Forbidden\r\n'; hdr_text; echo 'forbidden'; exit 0
 fi
 
-beat
+# Machine-to-machine requests must NOT count as a human watching the page.
+# A paired downstream box calls a=exchange on every refresh cycle (30 s), and
+# a pairing probe calls a=hello on every candidate IP. Refreshing the watch
+# window for those kept the aggregator pinned in the fast profile forever
+# (12 s full collection instead of 30 s) with nobody looking at it - measured
+# at 3x the idle CPU. Only a real page load (a=all / a=live) or a deliberate
+# user action (a=sync / a=collect) refreshes it.
+case "$action" in
+	exchange|hello|recv) ;;
+	*) beat ;;
+esac
 
 case "$action" in
 	collect|self)
