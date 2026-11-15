@@ -119,14 +119,24 @@ def read_version() -> str:
 
 
 def payload() -> list[tuple[str, pathlib.Path]]:
-    """Every file under src/, sorted, as (posix relative path, source path)."""
+    """Installed files, sorted, as (posix relative path, source path).
+
+    Everything under src/ maps straight onto the device root. The root LICENSE
+    is injected too: Apache-2.0 section 4(a) requires a copy of the license to
+    travel with any redistribution, and the .ipk is what people actually
+    download - a LICENSE that only exists in the git repo never reaches them.
+    """
     out = []
     for p in sorted(SRC.rglob("*")):
         if p.is_file():
             out.append((p.relative_to(SRC).as_posix(), p))
-    if not out:
+    lic = ROOT / "LICENSE"
+    if not lic.is_file():
+        fail("LICENSE is missing - the package cannot be redistributed without it")
+    out.append(("usr/share/opshare/LICENSE", lic))
+    if len(out) <= 1:
         fail("src/ is empty")
-    return out
+    return sorted(out, key=lambda it: it[0])
 
 
 def tar_bytes(entries: list[tuple[str, bytes, int]],

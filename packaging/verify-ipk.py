@@ -102,6 +102,11 @@ def main(paths: list[str]) -> int:
         if "usr/share/rpcd/acl.d/luci-app-opshare.json" not in data:
             problems.append("rpcd ACL is missing")
 
+        # Apache-2.0 4(a): a redistributed binary must carry the license text.
+        # The .ipk is the redistributed artifact here, not the git repository.
+        if b"Apache License" not in data.get("usr/share/opshare/LICENSE", (b"", 0))[0]:
+            problems.append("LICENSE is not shipped inside the package")
+
         if problems:
             for x in problems:
                 print("  FAIL " + x)

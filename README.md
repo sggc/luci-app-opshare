@@ -144,6 +144,28 @@ _dev/                      测试与开发脚本
 .github/workflows/build.yml  CI：测试 → 出包 → Release
 ```
 
+## 技术栈：为什么有好几种语言
+
+GitHub 的语言统计看着杂，其实是三层，每层只能用宿主提供的东西：
+
+| 层 | 语言 | 进包吗 |
+|---|---|---|
+| 设备运行时 | Shell（busybox sh / awk）、ucode、Lua | 是 |
+| 浏览器 | JavaScript、CSS、HTML | 是 |
+| 构建 / 测试 / 部署 | Python、Node | **否** |
+
+Python 占的那 23% 全是工具链（`build-ipk.py`、`verify-ipk.py`、`make-index.py`、
+`_dev/deploy.py`），一行都没装到路由器上——设备里只有 busybox，没有也不需要
+Python。正因为运行时没有任何编译产物，才能 `Architecture: all` 一个包通吃所有 CPU。
+
+ucode 和 Lua 并存不是冗余：新版 LuCI 走 `ucode/menu.d`，旧版走 Lua controller，
+两代 API 各要一套控制器；改菜单或路由时两边要同步。
+
+代价也说清楚：shell 那层没有类型和异常，busybox 的 awk 与 GNU 行为有差异
+（已经踩过 `match(s, re)` 必须传整段文本、花括号得写成 `[{]`）；服务端生成
+`all.json`、前端消费它，中间靠 `docs/ubus-api.md` 的人肉约定，没有 schema
+校验。这是这套技术栈真正的薄弱点，不是「语言种类多」本身。
+
 ## 已知限制
 
 - 无线详情（信号、速率）只能在真正带无线的节点上采；纯 AP 模式的硬路由
@@ -154,4 +176,13 @@ _dev/                      测试与开发脚本
 
 ## 许可证
 
-未指定。发布前请自行选定并加上 `LICENSE`。
+Apache-2.0，见 [LICENSE](LICENSE)。Copyright 2026 sggc。
+
+选它是两个理由：LuCI 生态本身就是 Apache-2.0，保持一致；更实际的是
+Apache-2.0 **单向兼容 GPL-3.0**——OPAssistant 用的正是 GPL-3.0，将来 App 侧
+想复用这里的接口定义或参考实现不会撞许可证。反过来若选 GPL-2.0-only，
+两者不兼容，代码就没法合并。
+
+`docs/ubus-api.md` 与 `src/` 使用同一许可；包内没有第三方代码。
+`build-ipk.py` 会把许可证文本打进 `usr/share/opshare/LICENSE`（Apache-2.0 §4(a)
+要求随分发物附上副本），`verify-ipk.py` 会检查它确实在包里。
