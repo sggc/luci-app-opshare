@@ -57,7 +57,25 @@ const chips = (tr.match(/class="iface/g) || []).length;
 const tags = [...rows.matchAll(/<tr([^>]*)>/g)].map(m => m[1]);
 const firstOff = tags.findIndex(t => /\boff\b/.test(t));
 const onlineAfterOff = tags.slice(firstOff + 1).filter(t => t && !/\boff\b/.test(t)).length;
+
+/* The fixture must keep at least one non-RFC1918 WAN address. app.js decides
+ * whether a node has an Internet uplink with isRfc1918(wan_ip). Sanitising
+ * every IPv4 into 10.0.x.x once erased that distinction: the Internet cloud
+ * vanished and the topology assertion failed with a symptom pointing at the
+ * renderer, when the real culprit was the test data. Guard the input here.
+ * This mirrors src/www/opshare/app.js isRfc1918() and _dev/sanitize.py is_lan().
+ */
+const wans = data.nodes.map(n => (n.node || {}).wan_ip || '').filter(Boolean);
+const pubWans = wans.filter(w => {
+  const p = w.split('.').map(Number);
+  return !(p.length === 4 && (p[0] === 10 ||
+    (p[0] === 172 && p[1] >= 16 && p[1] <= 31) ||
+    (p[0] === 192 && p[1] === 168) || p[0] === 127));
+});
+
 const checks = [
+  ['夹具保留公网 WAN（拓扑推断的前提）', pubWans.length > 0,
+    pubWans.length + ' public / ' + wans.length + ' wan: ' + wans.join(' / ')],
   ['一个节点一行', nodeRows === data.nodes.length, nodeRows + ' rows / ' + data.nodes.length + ' nodes'],
   ['接口 chip 存在', chips > 0, chips + ' chips'],
   ['无 SVG / 折线图', !/<svg|spark|polyline/.test(tr), ''],
