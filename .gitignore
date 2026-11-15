@@ -14,6 +14,8 @@ _dev/shots/
 _dev/relsim/
 _dev/edgeprof/
 _dev/edgeprof2/
+# Third-party reference packages and the extracted static apk binary (large).
+_dev/apkref/
 
 # The iframe A/B harness (shell.html, poke.html) is kept, but its inputs and
 # dumps are generated: page*.html come from _dev/make_preview.py, and the .txt

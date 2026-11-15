@@ -21,13 +21,25 @@ aarch64、mipsel、arm、x86。
 
 装完打开 LuCI → 网络 → 多设备信息共享，首次进入会自动配对。
 
-### 直接安装（24.10 及更新）
+### opkg（OpenWrt ≤ 24.10）
 
 ```sh
 V=1.0.0   # 换成 Release 页上的版本号
 opkg install --force-reinstall \
   https://github.com/sggc/luci-app-opshare/releases/download/v${V}/luci-app-opshare_${V}_all.ipk
 ```
+
+### apk（OpenWrt 25.12 及更新）
+
+```sh
+V=1.0.0   # 换成 Release 页上的版本号
+wget -O /tmp/opshare.apk \
+  https://github.com/sggc/luci-app-opshare/releases/download/v${V}/luci-app-opshare-${V}-r1.apk
+apk add --allow-untrusted /tmp/opshare.apk
+```
+
+25.12 起改用 apk-tools 3，包是 APK v3（ADB 二进制容器），**不认 `.ipk`，
+也不认旧版 apk v2**。资产未签名，故需 `--allow-untrusted`。
 
 ### 老版本固件（19.07 / 21.02 / 22.03）
 
@@ -72,20 +84,23 @@ ubus call opshare all      # 完整合并视图（慢刷）
 
 ## 构建
 
-无需 OpenWrt SDK，Python 标准库足够：
+`.ipk` 只需 Python 标准库；`.apk` 需要 apk-tools 3.x（CI 里跑在 Alpine 容器中）：
 
 ```sh
-python packaging/build-ipk.py --legacy-ar   # 出包，含两种容器格式
-python packaging/make-index.py              # 生成 feed 索引
+python packaging/build-ipk.py --legacy-ar   # 两种 ipk 容器格式
+python packaging/make-index.py              # opkg feed 索引
 python packaging/make-index.py dist/legacy
+sh packaging/build-apk.sh                  # APK v3，需 apk mkpkg
 ```
 
 | 产物 | 适用 |
 |---|---|
-| `dist/luci-app-opshare_<ver>_all.ipk` | OpenWrt ≥ 24.10 |
+| `dist/luci-app-opshare-<ver>-r1.apk` | OpenWrt 25.12+（apk） |
+| `dist/luci-app-opshare_<ver>_all.ipk` | 24.10（opkg，新容器） |
 | `dist/legacy/luci-app-opshare_<ver>_all_legacy.ipk` | 19.07 / 21.02 / 22.03 |
 
-版本号取自 `src/usr/share/opshare/version`，其他参数见脚本头部。
+三种都是 `all` / `noarch`，同一个文件通吃所有 CPU 架构。版本号取自
+`src/usr/share/opshare/version`；`APK_BIN` 可指向静态 `apk` 二进制。
 
 ## 测试
 

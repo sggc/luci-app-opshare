@@ -123,13 +123,24 @@ jobs:
           python packaging/make-index.py
           python packaging/make-index.py dist/legacy
 
+      - name: Build APK v3 (OpenWrt 25.12+)
+        run: |
+          set -eu
+          # OpenWrt 25.12 ships apk-tools 3 and an ADB binary .apk container.
+          # Only the official `apk mkpkg` produces that format, so build it in
+          # an Alpine container that already has apk-tools 3.x. The package is
+          # pure shell and static assets, hence arch=noarch for every CPU.
+          docker run --rm -v "$PWD":/work -w /work alpine:3.23 \
+            sh packaging/build-apk.sh "${{ steps.ver.outputs.version }}"
+          ls -l dist/*.apk
+
       - name: Checksums
         run: |
           set -eu
           cd dist
           # Flat names, because release assets are flat: `sha256sum -c` has to
           # work on the files as downloaded, not on the directory layout here.
-          sha256sum --text *.ipk legacy/*.ipk | sed 's|legacy/||' > SHA256SUMS
+          sha256sum --text *.ipk *.apk legacy/*.ipk | sed 's|legacy/||' > SHA256SUMS
           cat SHA256SUMS
 
       - name: Upload artifact
@@ -138,6 +149,7 @@ jobs:
           name: ipk-${{ steps.ver.outputs.version }}-${{ github.sha }}
           path: |
             dist/*.ipk
+            dist/*.apk
             dist/*.sha256
             dist/SHA256SUMS
             dist/Packages
@@ -190,6 +202,18 @@ jobs:
             https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/luci-app-opshare_${V}_all.ipk
           \`\`\`
 
+          ### Install (OpenWrt 25.12 and newer, apk)
+
+          \`\`\`sh
+          wget -O /tmp/opshare.apk \\
+            https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/luci-app-opshare-${V}-r1.apk
+          apk add --allow-untrusted /tmp/opshare.apk
+          \`\`\`
+
+          This is a native APK v3 (ADB) package built by \`apk mkpkg\`.
+          \`arch=noarch\`, so the same file works on every CPU. Unsigned, hence
+          \`--allow-untrusted\`. Do not use the \`.ipk\` assets on an apk system.
+
           ### Install (21.02 / 22.03, classic container)
 
           Those opkg builds cannot read the modern container. Grab the asset
@@ -228,6 +252,7 @@ jobs:
             --notes-file notes.md \
             dist/luci-app-opshare_*.ipk \
             dist/luci-app-opshare_*.ipk.sha256 \
+            dist/luci-app-opshare-*.apk \
             dist/SHA256SUMS \
             dist/Packages \
             dist/Packages.gz \

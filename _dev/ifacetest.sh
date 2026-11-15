@@ -17,7 +17,7 @@ trap 'rm -rf "$T"' EXIT INT TERM
 
 NET="$T/net"
 mkdir -p "$NET/br-lan/brif"
-for i in apcli0 apclix0 br-lan eth0 lan1 lan2 lan3 lo pppoe-wan ra0 rax0 tun0 wan; do
+for i in apcli0 apclix0 br-lan eth0 lan1 lan2 lan3 lo pppoe-wan ra0 ra1 rai1 rax0 tun0 wan; do
 	mkdir -p "$NET/$i"
 done
 for i in lan1 lan2 ra0 rax0; do : > "$NET/br-lan/brif/$i"; done
@@ -37,6 +37,8 @@ br-lan: 29785071964 200028284 0 20 0 0 0 697573 1439473132525 123974561 0 0 0 0 
 pppoe-wan: 44771069769 223645208 0 0 0 0 0 0 643644998335 496966335 0 0 0 0 0 0
    wan: 407419383660 492394287 806 330685 0 0 0 0 683627976885 590317207 0 0 0 0 0 0
    ra0: 264809974 1463533 4088553 0 0 0 0 4044 4111247012 3919588 0 0 0 0 0 0
+   ra1: 264809974 1463533 4088553 0 0 0 0 4044 4111247012 3919588 0 0 0 0 0 0
+  rai1: 21682566363 69606183 0 0 0 0 0 36677 173714777487 177572659 0 0 0 0 0 0
   lan3: 2161515042139 1593462158 0 330685 0 0 0 0 53731144 440909 0 0 0 0 0 0
 EOS
 
@@ -76,6 +78,8 @@ has "$OUT" 'pppoe-wan|session' 'PPPoE 会话口已纳入'
 has "$OUT" 'eth0|cpu'          'DSA CPU 汇聚口已纳入'
 hasnt "$OUT" '^lo|'            'lo 被排除'
 hasnt "$OUT" '^apcli'          '零流量 apcli 虚拟口不刷屏'
+hasnt "$OUT" '^ra1|'           '与 ra0 计数相同的 guest VAP 被折叠'
+hasnt "$OUT" '^rai1|'          '与 rax0 计数相同的 guest VAP 被折叠'
 
 N=$(wc -l < "$T/out" | tr -d ' ')
 [ "$N" = 10 ] && ok "恰好 10 个接口（原实现只有 6 个）" || no "接口数 $N，期望 10"
