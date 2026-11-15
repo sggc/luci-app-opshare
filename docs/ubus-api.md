@@ -38,7 +38,10 @@ curl -s -b jar -H 'Content-Type: application/json' \
 返回是标准的 ubus 信封，业务数据在 `result[1]`：
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":[0,{"schema":1,"api":1,"version":"1.0.0", ...}]}
+{"jsonrpc":"2.0","id":1,"result":[0,{"schema":1,"api":1,"version":"1.0.0",
+ "updated":1794017792,"nodes":2,"topology":"双 DHCP / 串联","master":"QWRT",
+ "mode":"hub","power":2,"auto_peers":1,
+ "intervals":{"refresh":30,"idle":60,"traffic":2,"live_ms":2000}}]}
 ```
 
 注意 `result[0]` 是 ubus 状态码，`0` 才代表成功。插件本身从不报错——
@@ -99,10 +102,13 @@ curl -s -b jar -H 'Content-Type: application/json' \
 
 完整合并视图，网页 UI 消费的就是它（`/tmp/opshare/all.json` 原样返回）。
 
+下面是骨架（数组内元素为空），各字段含义见后续表格，`info` 的示例见第 3 节。
+
 ```json
-{"schema":2,"updated":1794017792,"ui":{...},"aliases":[],
- "meta":{"topology":"...","master":"...","server_count":1,"role_rule":"...","externals":[]},
- "nodes":[{"_meta":{...},"schema":2,"node":{...},"radios":[],"clients":[],"leases":[],"traffic":[]}]}
+{"schema":2,"updated":1794017792,"ui":{},"aliases":[],
+ "meta":{"topology":"双 DHCP / 串联","master":"QWRT","server_count":1,"role_rule":"dhcp","externals":[]},
+ "nodes":[{"_meta":{"section":"main","self":1},"schema":2,
+ "node":{"wan_ip":"198.51.100.1"},"radios":[],"clients":[],"leases":[],"traffic":[]}]}
 ```
 
 ### 顶层
@@ -206,10 +212,15 @@ ifname | kind | rx_total | tx_total | rx_delta | tx_delta | ts | prev_ts | dt | 
 - 客户端必须容忍未知字段（以后会加），也必须容忍空串和 `0`。
 - 文件还没生成时返回空骨架，不会让 `ubus call` 失败：
 
-  ```json
-  {"schema":2,"updated":0,"ui":{},"aliases":[],"meta":{},"nodes":[]}
-  {"schema":1,"ts":0,"nodes":[]}
-  ```
+```json
+{"schema":2,"updated":0,"ui":{},"aliases":[],"meta":{},"nodes":[]}
+```
+
+`live` 的空骨架：
+
+```json
+{"schema":1,"ts":0,"nodes":[]}
+```
 
   所以「`nodes` 为空数组」= 没配对或还没合并过，不是错误。
 - 三个方法都**不接参数**，`list` 里声明的是 `{}`。多传参数会被 ubus 拒掉。

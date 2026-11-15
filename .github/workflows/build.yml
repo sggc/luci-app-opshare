@@ -57,6 +57,9 @@ jobs:
       - name: Pairing logic test (offline, stubbed uci/wget)
         run: sh _dev/pairtest.sh
 
+      - name: Data contract check (rpcd / fixture / API doc)
+        run: python _dev/check-contract.py
+
       - name: Builds are reproducible
         run: |
           set -eu

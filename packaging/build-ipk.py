@@ -125,6 +125,12 @@ def payload() -> list[tuple[str, pathlib.Path]]:
     is injected too: Apache-2.0 section 4(a) requires a copy of the license to
     travel with any redistribution, and the .ipk is what people actually
     download - a LICENSE that only exists in the git repo never reaches them.
+
+    Why Apache-2.0 rather than GPL-2.0-only: LuCI itself is Apache-2.0, and
+    Apache-2.0 is one-way compatible with GPL-3.0 (the mobile app that will
+    consume this interface). GPL-2.0-only and GPL-3.0 cannot be combined, which
+    would have blocked code reuse on the app side. The README states only the
+    fact of the license; the reasoning belongs here with the build logic.
     """
     out = []
     for p in sorted(SRC.rglob("*")):
