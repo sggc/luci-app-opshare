@@ -29,7 +29,6 @@
 			</select>
 			<label class="auto" title="勾选：每次界面刷新都让路由器立刻合并一次各节点的最新快照（服务端 force_throttle 默认 10 秒内至多一次）。不勾选：只读后台周期生成的缓存快照，不触发任何采集。">
 				<input type="checkbox" id="chk-realtime"> 即时刷新</label>
-			<label class="auto"><input type="checkbox" id="chk-offline"> 显示离线</label>
 			<button id="btn-theme" class="btn ghost" type="button" title="切换深浅色">◐</button>
 		</div>
 	</header>
@@ -40,6 +39,8 @@
 		<div class="panel-head">
 			<h2>网络拓扑</h2>
 			<span class="hint" id="topology-hint">按 WAN → 上级 LAN 自动推断层级</span>
+			<label class="auto" title="只作用于这张拓扑图：关闭后，离线终端不再画成灰色卡片。设置保存在本浏览器，下次打开仍生效。">
+				<input type="checkbox" id="chk-offline-topo"> 拓扑显示离线</label>
 			<details class="note">
 				<summary>说明</summary>
 				<div class="note-body">每个节点是一张卡片：左侧为设备信息与<b>上行链路</b>（介质 / 端口 / 协商速率 / 上级节点），右侧按<b>有线 · 2.4G · 5G</b> 分道列出下挂终端。<b>卡片到终端的实际接线</b>：卡片右侧引出一条总线，总线上按介质分出支路，每台终端再从自己的介质端口上接出一小段——所以看线就知道谁接在哪、走的什么介质；节点之间的连线用流动光点表示层级方向。只有安装本插件的节点才能采集无线关联、信号、频段与协商速率。普通硬路由：<b>桥接 / AP 模式</b>下，上级 DHCP、ARP 只能看到其下终端的 IP/MAC/主机名，看不到连在哪个 AP 及无线详情；<b>路由 / NAT 模式</b>下，上游只能看到硬路由自身一个 MAC，其下设备完全不可见。可在 <code>/etc/config/opshare</code> 用 <code>config external</code> 手工声明，拓扑图会画成灰色虚线节点。<br><b>零配置配对</b>：两台都装好本插件后，各自会在两分钟内探测<b>默认网关</b>与<b>最新 DHCP 租约</b>，用 HTTP 交换身份与共享密钥自动配对——不需要填 IP、不需要授权 SSH 密钥，桥接与双 NAT 都适用。CPU 更强的一台自动当聚合者，另一台被动接收；在 <code>/etc/config/opshare</code> 里设 <code>option auto_pair 0</code> 可改为手工管理。</div>
@@ -85,6 +86,8 @@
 					<option value="wired">有线</option>
 				</select>
 			</div>
+			<label class="auto" title="只作用于下方列表：关闭后隐藏离线设备行。设置保存在本浏览器，下次打开仍生效。">
+				<input type="checkbox" id="chk-offline-list"> 列表显示离线</label>
 		</div>
 		<div class="table-scroll">
 			<table class="tbl">

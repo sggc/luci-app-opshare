@@ -17,7 +17,9 @@
 		'#06b6d4', '#ec4899', '#84cc16'];
 	var LSK = { aliases: 'opshare.aliases', names: 'opshare.nodeNames',
 		colors: 'opshare.nodeColors', refresh: 'opshare.refreshMs',
-		realtime: 'opshare.realtime', offline: 'opshare.showOffline',
+		realtime: 'opshare.realtime',
+		offline: 'opshare.showOffline',          // legacy single toggle, migrated once
+		offlineTopo: 'opshare.showOfflineTopo', offlineList: 'opshare.showOfflineList',
 		roles: 'opshare.roleOverrides' };
 
 	function $(id) { return document.getElementById(id); }
@@ -45,7 +47,8 @@
 		aliases: lsGet(LSK.aliases, {}), nodeNames: lsGet(LSK.names, {}),
 		nodeColors: lsGet(LSK.colors, {}), roleOverrides: lsGet(LSK.roles, {}),
 		refreshMs: lsGet(LSK.refresh, null), realtime: lsGet(LSK.realtime, null),
-		showOffline: lsGet(LSK.offline, null)
+		showOfflineTopo: lsGet(LSK.offlineTopo, null),
+		showOfflineList: lsGet(LSK.offlineList, null)
 	};
 
 	function bandLabel(b) {
@@ -484,7 +487,7 @@
 	function buildLanes(n, skip) {
 		var cl = (state.clients || []).filter(function (c) {
 			return c._node === n.name && !c._moved &&
-				(state.showOffline === 1 || c.online === 1) &&
+				(state.showOfflineTopo === 1 || c.online === 1) &&
 				!skip['ip:' + (c.ip || '')] && !skip[String(c.mac || '').toLowerCase()];
 		});
 		var buckets = {};
@@ -863,8 +866,12 @@
 			(ext.length ? ' · ' + ext.length + ' 个不可采集设备' : '');
 	}
 
-	var KIND_LABEL = { wan: 'WAN', lan: 'LAN', wifi: '无线', port: '物理口' };
-	var KIND_ORDER = { wan: 0, lan: 1, wifi: 2, port: 3 };
+	var KIND_LABEL = { wan: 'WAN', lan: 'LAN', wifi: '无线', port: '物理口',
+		session: '拨号', vpn: 'VPN', cpu: 'CPU 汇聚' };
+	// lan (br-lan) and cpu (DSA master) already include their member ports, so
+	// they are labelled and pushed to the end. Adding them to the physical-port
+	// rows would count the same packets twice.
+	var KIND_ORDER = { wan: 0, session: 1, vpn: 2, lan: 3, wifi: 4, port: 5, cpu: 9 };
 	var STATE_LABEL = {
 		baseline: '首次采样：本帧作为基线，下一周期开始计增量',
 		reboot: '设备已重启：计数器从新基线开始，本次增量跳过',
@@ -896,8 +903,10 @@
 					Number(t.tx_total) === 0 && Number(t.rx_delta) === 0 &&
 					Number(t.tx_delta) === 0) return;
 				if (note && flags.indexOf(note) < 0) flags.push(note);
-				var skip = (st === 'reset' || st === 'clock' || st === 'baseline' || st === 'reboot');
-				var line = function (cls, arrow, name, total, delta) {
+			var skip = (st === 'reset' || st === 'clock' || st === 'baseline' || st === 'reboot');
+			var agg = (t.kind === 'cpu' || t.kind === 'lan')
+				? ' · 汇聚口：已包含物理口计数，勿相加' : '';
+			var line = function (cls, arrow, name, total, delta) {
 					var d = skip ? '<span class="d muted">—</span>'
 						: '<span class="d">' + esc(delta) + '</span>';
 					return '<span class="ib ' + cls + '"><span class="k"><i>' + arrow + '</i>' +
@@ -905,7 +914,7 @@
 				};
 				chips += '<span class="iface' + (skip ? ' flagged' : '') + '" title="' +
 					esc(t.ifname + ' · 累计 上传 ' + fmtBytes(t.tx_total) + ' / 下载 ' + fmtBytes(t.rx_total) +
-						(note ? ' · ' + note : '')) + '">' +
+						(note ? ' · ' + note : '') + agg) + '">' +
 					'<span class="ih"><b>' + esc(t.ifname) + '</b><span class="tagk">' +
 					esc(KIND_LABEL[t.kind] || t.kind || '口') + '</span></span>' +
 					line('up', '↑', '上传', fmtBytes(t.tx_total), fmtDelta(t.tx_delta)) +
@@ -957,7 +966,7 @@
 		var q = ($('f-search').value || '').toLowerCase();
 		var fn = $('f-node').value, fb = $('f-band').value, ft = $('f-type').value;
 		var rows = clients.filter(function (c) {
-			if (state.showOffline !== 1) {
+			if (state.showOfflineList !== 1) {
 				if (c.online !== 1 || c._moved) return false;
 			}
 			if (fn && c._node !== fn) return false;
@@ -1073,12 +1082,20 @@
 		if (state.refreshMs === null) state.refreshMs = ui.refresh_ms || 10000;
 		if (state.realtime === null) state.realtime = ui.realtime || 0;
 		live.ms = n(ui.live_ms) || 2000;
-		if (state.showOffline === null)
-			state.showOffline = (ui.show_offline === undefined ? 1 : ui.show_offline);
+		// Topology and list used to share one toggle. Migrate that old value
+		// once so upgrading does not flip anything; from then on each view
+		// remembers its own setting in localStorage, independently.
+		var legacy = lsGet(LSK.offline, null);
+		var dflt = (ui.show_offline === undefined ? 1 : ui.show_offline);
+		if (state.showOfflineTopo === null)
+			state.showOfflineTopo = (legacy === null ? dflt : legacy);
+		if (state.showOfflineList === null)
+			state.showOfflineList = (legacy === null ? dflt : legacy);
 		state.grace = n(ui.session_grace) || 60;
 		$('sel-interval').value = String(state.refreshMs);
 		$('chk-realtime').checked = !!state.realtime;
-		$('chk-offline').checked = !!state.showOffline;
+		$('chk-offline-topo').checked = !!state.showOfflineTopo;
+		$('chk-offline-list').checked = !!state.showOfflineList;
 	}
 
 	function applyAliases(data) {
@@ -1273,10 +1290,16 @@
 		state.realtime = this.checked ? 1 : 0; lsSet(LSK.realtime, state.realtime);
 		updateSourceLabel();
 	});
-	$('chk-offline').addEventListener('change', function () {
-		state.showOffline = this.checked ? 1 : 0; lsSet(LSK.offline, state.showOffline);
-		renderRows();
+	$('chk-offline-topo').addEventListener('change', function () {
+		state.showOfflineTopo = this.checked ? 1 : 0;
+		lsSet(LSK.offlineTopo, state.showOfflineTopo);
 		if (state.data) { renderTopology(state.data); notifyHeight(); }
+	});
+	$('chk-offline-list').addEventListener('change', function () {
+		state.showOfflineList = this.checked ? 1 : 0;
+		lsSet(LSK.offlineList, state.showOfflineList);
+		renderRows();
+		notifyHeight();
 	});
 	$('btn-theme').addEventListener('click', function () {
 		var cur = document.body.getAttribute('data-theme');

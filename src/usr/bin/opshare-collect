@@ -461,22 +461,16 @@ yield   # ---- phase 3 done: stations ----
 # snapshot itself is maintained by --traffic-only on an even cadence; in
 # --step mode this phase merely READS the file - no extra computation at all.
 if [ "$TRAFFIC" = "1" ]; then
-	WIFIS=$(cut -d'|' -f1 "$IFACES" | tr '\n' ' ')
-	BRPORTS=$(ls /sys/class/net/"$BRDEV"/brif/ 2>/dev/null | tr '\n' ' ')
-	: > "$IFLIST"; : > "$IFKINDS"
-	for i in $(printf '%s\n' $WANDEV $BRDEV $WIFIS $BRPORTS | sed '/^$/d' | sort -u); do
-		case "$i" in
-			lo|sit*|dummy*|ifb*|teql*|apcli*|oam*|omci*|gre*|tun*|vpn*|docker*) continue ;;
-		esac
-		[ -d "/sys/class/net/$i" ] || continue
-		case "$i" in
-			"$WANDEV") k=wan ;;
-			"$BRDEV")  k=lan ;;
-			*) case " $WIFIS " in *" $i "*) k=wifi ;; *) k=port ;; esac ;;
-		esac
-		printf '%s\n' "$i" >> "$IFLIST"
-		printf '%s|%s\n' "$i" "$k" >> "$IFKINDS"
-	done
+	# The interface list is built by a separate program so it can be tested
+	# offline: it covers every configured L3 device (IPTV port, VPN tunnel)
+	# and every netdev with traffic, not just the four legacy categories.
+	# Write to .tmp + rename so a sampler running at the same time never sees
+	# a half-written list.
+	cut -d'|' -f1 "$IFACES" | sed '/^$/d' > "$TMP/wifis"
+	/usr/bin/opshare-ifaces "$WANDEV" "$BRDEV" "$TMP/wifis" > "$IFKINDS.tmp"
+	cut -d'|' -f1 "$IFKINDS.tmp" > "$IFLIST.tmp"
+	mv "$IFKINDS.tmp" "$IFKINDS"
+	mv "$IFLIST.tmp" "$IFLIST"
 	# A manual one-shot collection (not --step) has no sampler behind it.
 	[ "$YIELD" = "0" ] && /usr/bin/opshare-traffic
 fi

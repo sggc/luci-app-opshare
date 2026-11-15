@@ -92,6 +92,7 @@ python packaging/make-index.py dist/legacy
 ```sh
 node _dev/uitest.js              # 前端渲染（无浏览器）
 sh _dev/pairtest.sh              # 配对与合并逻辑（桩掉 uci/wget/ip）
+sh _dev/ifacetest.sh             # 接口枚举（桩掉 sysfs/procfs）
 python _dev/check-contract.py    # 数据字段与接口文档对账
 python packaging/verify-ipk.py
 ```

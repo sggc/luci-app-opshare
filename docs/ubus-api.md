@@ -171,8 +171,25 @@ curl -s -b jar -H 'Content-Type: application/json' \
 
 `leases[]`：`mac` `ip` `hostname`——DHCP 租约，可能比 `clients` 多。
 
-`traffic[]`：`ifname` `kind`（`wan`/`lan`/…）`state` `rx_total` `tx_total`
-（字节，累计）`rx_delta` `tx_delta`（字节/`dt`）`ts` `prev_ts` `dt`（秒）。
+`traffic[]`：`ifname` `kind` `state` `rx_total` `tx_total`（字节，累计）
+`rx_delta` `tx_delta`（字节/`dt`）`ts` `prev_ts` `dt`（秒）。
+
+`kind` 取值：
+
+| 值 | 含义 |
+|---|---|
+| `wan` | `network.wan.device` 指定的物理 WAN 口 |
+| `session` | PPPoE / PPP 会话口（如 `pppoe-wan`） |
+| `vpn` | 隧道接口（如 `tun0`、`wg0`） |
+| `lan` | LAN 桥（如 `br-lan`） |
+| `wifi` | AP 模式无线接口 |
+| `port` | 物理口，含从桥里摘出做独立三层网的口（如 IPTV 的 `lan3`） |
+| `cpu` | DSA / CPU 汇聚口（如 `eth0`） |
+
+`lan` 和 `cpu` 是**汇聚计数器**，已经包含其成员物理口，不要与 `port` 行相加。
+接口清单由 `opshare-ifaces` 生成：遍历 `uci show network` 的所有 `device`、
+桥成员、AP 无线接口，以及 `/proc/net/dev` 中计数器非零的接口；零流量虚拟口
+（`apcli*`、`veth*`）与 `lo` 不列出。
 
 ---
 

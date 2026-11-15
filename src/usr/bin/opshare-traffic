@@ -72,13 +72,17 @@ fi
 [ "$_wn" -gt 0 ] || exit 0
 
 # ---- first run without the collector's interface list ---------------------
-# (one-off, only until the full collector has written its list)
+# (one-off, only until the full collector has written its list). Use the same
+# builder as the collector so the very first sample already includes IPTV /
+# VPN / PPPoE interfaces; the wireless hint file is absent here, so the
+# builder falls back to recognising radio names.
 if [ ! -s "$IFLIST" ]; then
 	_br=$(uci -q get network.lan.device 2>/dev/null); [ -n "$_br" ] || _br=br-lan
 	_wan=$(uci -q get network.wan.device 2>/dev/null)
-	{ printf '%s\n' "$_br"; printf '%s\n' "$_wan"
-	  ls "/sys/class/net/$_br/brif/" 2>/dev/null; } |
-		sed '/^$/d' | sort -u > "$IFLIST"
+	/usr/bin/opshare-ifaces "$_wan" "$_br" > "$IFKINDS.tmp"
+	cut -d'|' -f1 "$IFKINDS.tmp" > "$IFLIST.tmp"
+	mv "$IFKINDS.tmp" "$IFKINDS"
+	mv "$IFLIST.tmp" "$IFLIST"
 fi
 [ -f "$TSTATE" ] || : > "$TSTATE"
 

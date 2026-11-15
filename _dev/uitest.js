@@ -119,12 +119,96 @@ const checks = [
   })(), (tr.split('<span class="iface').length - 1) + ' ifaces'],
   ['前端有独立计数器通道（live）', /function pollLive/.test(SRC) && /function applyLive/.test(SRC) &&
     /a=live/.test(SRC) && /live_ms/.test(SRC), ''],
-  ['非法频宽已清洗', !/13216|13076/.test(rows), '']
+  ['非法频宽已清洗', !/13216|13076/.test(rows), ''],
+  ['接口类型覆盖 VPN / 拨号 / CPU 汇聚',
+    /vpn: 'VPN'/.test(SRC) && /session: '拨号'/.test(SRC) && /cpu: 'CPU 汇聚'/.test(SRC), ''],
+  ['汇聚口标注勿与物理口相加', /勿相加/.test(SRC), '']
 ];
 if (process.env.OPSHARE_TEST_EXTERNALS === '1') {
   checks.push(['不可采集硬路由画成虚线节点',
     /topo-unmanaged/.test(topo) && /无法采集/.test(topo), '']);
 }
+/* The topology and the client list each have their own "show offline" toggle.
+ * They used to share one state variable, so turning either off hid offline
+ * devices in both views. Boot a fresh sandbox with a persistent store so we
+ * can drive the real change handlers and then reopen the page. */
+(function () {
+  function boot(store) {
+    const e = {};
+    const el = (id) => (e[id] || (e[id] = {
+      id, innerHTML: '', textContent: '', value: '', checked: false, hidden: false,
+      style: {}, children: [], _h: {},
+      addEventListener(t, fn) { this._h[t] = fn; }, setAttribute() {},
+      getAttribute() { return null; }, querySelector() { return null; },
+      querySelectorAll() { return []; }, appendChild() {}, focus() {}, select() {},
+      insertBefore() {}, offsetTop: 0, offsetHeight: 0, scrollHeight: 0
+    }));
+    const w = {
+      __OPSHARE_NO_AUTO__: true,
+      __OPSHARE_DATA__: JSON.parse(JSON.stringify(data)),
+      addEventListener() {}, matchMedia() { return { matches: false }; },
+      prompt() { return null; }, location: { origin: 'http://router' }, parent: null
+    };
+    w.parent = w;                              // notifyHeight() exits early
+    const wrap = el('.wrap');
+    const sb = {
+      console, Date, Math, JSON, Number, String, Object, Array, isFinite,
+      parseInt, parseFloat, encodeURIComponent, RegExp, Error,
+      document: {
+        getElementById(id) { return id === 'err-box' ? (e[id] || null) : el(id); },
+        addEventListener() {}, hidden: false,
+        querySelectorAll() { return []; }, querySelector() { return wrap; },
+        createElement() { return el('__t' + Math.random()); },
+        body: { setAttribute() {}, getAttribute() { return null; }, scrollHeight: 0 },
+        documentElement: { scrollHeight: 0 }
+      },
+      window: w,
+      localStorage: {
+        getItem(k) { return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; },
+        setItem(k, v) { store[k] = String(v); }
+      },
+      setTimeout() { return 0; }, clearTimeout() {}, setInterval() { return 0; }
+    };
+    sb.globalThis = sb;
+    vm.createContext(sb);
+    vm.runInContext(SRC, sb);
+    return { e, el, store };
+  }
+  const offChips = (h) => (h.match(/class="topo-chip off"/g) || []).length;
+  const offRows  = (h) => (h.match(/<span class="tag off">离线<\/span>/g) || []).length;
+  const click = (b, id, checked) => b.el(id)._h.change.call({ checked });
+
+  const store = {};
+  const a = boot(store);
+  const chips0 = offChips(a.el('topology').innerHTML);
+  const rows0 = offRows(a.el('rows').innerHTML);
+  checks.push(['夹具里确实有离线终端', chips0 > 0 && rows0 > 0,
+    chips0 + ' chips / ' + rows0 + ' rows']);
+
+  click(a, 'chk-offline-topo', false);
+  const chips1 = offChips(a.el('topology').innerHTML);
+  const rows1 = offRows(a.el('rows').innerHTML);
+  checks.push(['关拓扑离线只影响拓扑图', chips1 === 0 && rows1 === rows0,
+    'chips ' + chips0 + '→' + chips1 + ', rows ' + rows0 + '→' + rows1]);
+
+  click(a, 'chk-offline-list', false);
+  checks.push(['关列表离线只影响客户端列表',
+    offRows(a.el('rows').innerHTML) === 0 && offChips(a.el('topology').innerHTML) === 0,
+    '']);
+  checks.push(['两个开关各写各的键',
+    store['opshare.showOfflineTopo'] === '0' && store['opshare.showOfflineList'] === '0',
+    JSON.stringify(store)]);
+
+  const b = boot(store);                     // reopen the page with the same store
+  checks.push(['下次打开仍记住两个开关',
+    b.el('chk-offline-topo').checked === false && b.el('chk-offline-list').checked === false,
+    '']);
+  click(b, 'chk-offline-topo', true);
+  checks.push(['改一个不会顺带改另一个',
+    store['opshare.showOfflineTopo'] === '1' && store['opshare.showOfflineList'] === '0',
+    JSON.stringify(store)]);
+})();
+
 /* Regression: the LuCI frame must be told the *content* height. When the
  * message carried document.scrollHeight (inflated by the frame's own height)
  * the frame grew on every message and the page ended in a blank strip. */

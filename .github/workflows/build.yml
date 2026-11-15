@@ -60,6 +60,9 @@ jobs:
       - name: Data contract check (rpcd / fixture / API doc)
         run: python _dev/check-contract.py
 
+      - name: Interface enumeration test (stubbed sysfs / procfs)
+        run: sh _dev/ifacetest.sh
+
       - name: Builds are reproducible
         run: |
           set -eu

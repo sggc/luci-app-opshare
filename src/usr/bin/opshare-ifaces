@@ -1,0 +1,112 @@
+#!/bin/sh
+# Build the interface counter list for opshare-traffic.
+#
+# Usage: opshare-ifaces <wan-device> <lan-bridge> [wifis-file]
+# Output: one "ifname|kind" per line, sorted, on stdout.
+#
+# Why this is a separate program: the old list was a whitelist of four things
+#   network.wan.device + network.lan.device + AP radios + bridge members
+# which silently drops any interface that was pulled out of the LAN bridge to
+# serve as its own L3 network. Real boxes hit this constantly: an IPTV port
+# (lan3, proto dhcp), an OpenVPN server (tun0), a PPPoE session (pppoe-wan),
+# the DSA CPU port (eth0). One home router had 2.16 TB of IPTV traffic and
+# 4.5 GB of VPN traffic that the page never showed - not a sampling failure,
+# just an interface that was never a candidate.
+#
+# The candidate set is now:
+#   1. every device named in `uci show network` (catches lan3 and tun0)
+#   2. members of the LAN bridge
+#   3. AP wireless interfaces handed over by the collector
+#   4. every netdev in /proc/net/dev with non-zero counters (catches eth0,
+#      pppoe-wan, and any interface the config forgot to mention)
+#   5. the WAN device and the LAN bridge themselves
+#
+# Zero-traffic virtual interfaces are not listed, so the page does not fill up
+# with apcli*/veth* stubs. lo is the only name still excluded explicitly.
+#
+# `kind` is a display hint, not a filter. cpu/lan are aggregate counters that
+# already include their member ports, so the UI labels them and warns against
+# adding them up. See src/www/opshare/app.js KIND_LABEL.
+#
+# Test hooks (used by _dev/ifacetest.sh, never set on a router):
+#   OP_NETDIR   directory standing in for /sys/class/net
+#   OP_PROCDEV  file standing in for /proc/net/dev
+#   OP_UCIDEVS  space-separated list standing in for `uci show network`
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+export PATH
+
+WAN=$1
+BR=$2
+WIFIS=${3:-}
+NETDIR=${OP_NETDIR:-/sys/class/net}
+PROCDEV=${OP_PROCDEV:-/proc/net/dev}
+
+T=$(mktemp -d /tmp/opshare-ifaces.XXXXXX 2>/dev/null) || T="/tmp/opshare-ifaces.$$"
+mkdir -p "$T" 2>/dev/null
+trap 'rm -rf "$T"' EXIT INT TERM 2>/dev/null
+
+: > "$T/cand"
+
+# 1) every L3 device in the network config. `network.@device[0].name` and
+#    `option device` both land here; `ports` does not, which is exactly why a
+#    port removed from the bridge used to disappear.
+if [ -n "${OP_UCIDEVS:-}" ]; then
+	printf '%s\n' "$OP_UCIDEVS" | tr ' ' '\n' >> "$T/cand"
+else
+	uci show network 2>/dev/null |
+		sed -n "s/^network\.[^.]*\.device='\([^']*\)'.*/\1/p" >> "$T/cand"
+fi
+
+# 2) bridge members
+[ -n "$BR" ] && ls "$NETDIR/$BR/brif/" 2>/dev/null >> "$T/cand"
+
+# 3) AP radios discovered by the collector (one ifname per line)
+[ -s "$WIFIS" ] && cat "$WIFIS" >> "$T/cand"
+
+# 4) anything with real traffic. /proc/net/dev has 8 RX and 8 TX columns;
+#    $2 is RX bytes and $10 is TX bytes. A device that has never carried a
+#    packet is noise (apcli0, apclix0, ...), so it is left out.
+[ -r "$PROCDEV" ] && awk 'NR > 2 {
+	name = $1; sub(/:$/, "", name)
+	if (name != "" && ($2 + $10) > 0) print name
+}' "$PROCDEV" >> "$T/cand"
+
+# 5) baseline
+printf '%s\n%s\n' "$WAN" "$BR" >> "$T/cand"
+
+# Wireless names double as a fallback when the collector has not run yet
+# (opshare-traffic's first-run path calls this without a wifis file).
+WIFIS_SP=
+if [ -s "$WIFIS" ]; then
+	WIFIS_SP=" $(tr '\n' ' ' < "$WIFIS") "
+fi
+
+sort -u "$T/cand" | while IFS= read -r i; do
+	[ -n "$i" ] || continue
+	case "$i" in
+		lo|sit0|dummy0|teql0) continue ;;
+	esac
+	# Logical names in UCI that have no netdev (wan6, wan_6, ...) are skipped.
+	[ -d "$NETDIR/$i" ] || continue
+
+	case "$i" in
+		"$WAN") k=wan ;;
+		"$BR")  k=lan ;;
+		wg*|tun*|tap*|*vpn*) k=vpn ;;
+		pppoe*|ppp[0-9]*|l2tp*|pptp*) k=session ;;
+		eth[0-9]*|dsa*|cpu*) k=cpu ;;
+		*)
+			case "$WIFIS_SP" in
+				*" $i "*) k=wifi ;;
+				*)
+					case "$i" in
+						ra[0-9]*|rai[0-9]*|rax[0-9]*|wlan[0-9]*|wl[0-9]*|ath[0-9]*) k=wifi ;;
+						*) k=port ;;
+					esac
+					;;
+			esac
+			;;
+	esac
+	printf '%s|%s\n' "$i" "$k"
+done
