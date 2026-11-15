@@ -23,8 +23,9 @@ ImmortalWrt / QWRT 的客户端列表、无线信息、DHCP 租约和接口流�
 ### 直接装（24.10 及更新）
 
 ```sh
+V=1.0.0   # 换成 Release 页上的版本号
 opkg install --force-reinstall \
-  https://github.com/<owner>/luci-app-opshare/releases/latest/download/luci-app-opshare_1.0.0_all.ipk
+  https://github.com/sggc/luci-app-opshare/releases/download/v${V}/luci-app-opshare_${V}_all.ipk
 ```
 
 装完打开 LuCI → 网络 → 多设备信息共享。第一次进页面会自己做一次配对。
@@ -37,7 +38,7 @@ opkg install --force-reinstall \
 ### 当 feed 用（有 `opkg upgrade`）
 
 ```sh
-echo "src/gz opshare https://github.com/<owner>/luci-app-opshare/releases/latest/download" \
+echo "src/gz opshare https://github.com/sggc/luci-app-opshare/releases/latest/download" \
   >> /etc/opkg/customfeeds.conf
 opkg update
 opkg install luci-app-opshare
@@ -48,13 +49,18 @@ feed 没有签名，需要在 `/etc/opkg.conf` 里加 `option check_signature 0`
 
 ### 从源码装（开发用）
 
+`install.sh` 是在**设备上**跑的，先把整个工程目录拷过去：
+
 ```sh
-sh install.sh root@192.168.1.1     # scp 到设备并重启服务
-sh uninstall.sh root@192.168.1.1   # 反向
+scp -r . root@192.168.1.1:/tmp/opshare-src
+ssh root@192.168.1.1 'sh /tmp/opshare-src/install.sh'
+# 卸载（保留配置与 SSH key，方便重装）
+ssh root@192.168.1.1 'sh /tmp/opshare-src/uninstall.sh'
 ```
 
 `install.sh` 只覆盖 `src/` 下的文件，不动 `/etc/config/opshare`，改完代码推一次
-就能看到效果。
+就能看到效果。开发时更省事的是 `python _dev/deploy.py`：自动推到两台实验机并跑
+完整回归（`--verify` 只跑回归），凭据放在 git-ignored 的 `_dev/devconf.json`。
 
 ## ubus 接口
 
